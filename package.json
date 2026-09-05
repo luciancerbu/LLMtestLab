@@ -1,0 +1,1 @@
+{"name":"llm-test-lab","private":true,"type":"module","engines":{"node":">=22"},"scripts":{"start":"node server.mjs","check":"node --check server.mjs && node --check public/app.js && node --check catalog.mjs && node --check metrics.mjs && node --check settings.mjs"}}

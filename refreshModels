@@ -1,0 +1,6 @@
+#!/bin/sh
+
+set -eu
+PROJECT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$PROJECT"
+exec node scripts/refresh-models.mjs

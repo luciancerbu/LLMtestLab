@@ -1,0 +1,18 @@
+#!/bin/sh
+
+set -eu
+
+SESSION="llm-test-lab"
+PROJECT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  /usr/bin/osascript -e "tell application \"Terminal\"
+activate
+do script \"tmux attach-session -t $SESSION\"
+end tell"
+  printf 'Opened existing tmux session %s in Terminal.\n' "$SESSION"
+  exit 0
+fi
+
+tmux new-session -d -s "$SESSION" -c "$PROJECT" 'npm start'
+printf 'LLM Test Lab started in tmux session %s.\n' "$SESSION"

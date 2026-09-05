@@ -1,0 +1,10 @@
+import os from 'node:os';
+import path from 'node:path';
+export const ROOT=import.meta.dirname;
+export const DATA=path.resolve(process.env.LLM_LAB_DATA_DIR||path.join(ROOT,'data'));
+export const PROMPTS=path.resolve(process.env.LLM_LAB_PROMPTS_DIR||path.join(ROOT,'prompts'));
+export const RUNS=path.resolve(process.env.LLM_LAB_RUNS_DIR||path.join(ROOT,'runs'));
+export const PI_MODELS=process.env.PI_MODELS_PATH||path.join(os.homedir(),'.pi/agent/models.json');
+export const TMUX=process.env.TMUX_BIN||'tmux';
+export const PI=process.env.PI_BIN||'pi';
+export const LLAMA_SERVER=process.env.LLAMA_SERVER_BIN||path.join(ROOT,'runtime/llama.cpp/bin/llama-server');

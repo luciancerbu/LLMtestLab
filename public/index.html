@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en" data-theme-mode="auto" data-scheme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#07090c">
+  <script>
+    (() => {
+      let saved = null;
+      try { saved = localStorage.getItem('llm-test-lab-theme'); } catch {}
+      const mode = ['auto', 'light', 'dark'].includes(saved) ? saved : 'auto';
+      const systemDark = matchMedia('(prefers-color-scheme: dark)').matches;
+      document.documentElement.dataset.themeMode = mode;
+      document.documentElement.dataset.scheme = mode === 'auto' ? (systemDark ? 'dark' : 'light') : mode;
+    })();
+  </script>
+  <title>LLM Test Lab</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand"><span class="brand-mark">L</span><span><strong>LLM Test Lab</strong><small>Local model testing</small></span></div>
+      <div class="top-status"><div class="local"><i></i><span>Dashboard ready</span></div><button id="open-settings" class="settings-button" aria-label="Open settings"><span>⚙︎</span> Settings</button></div>
+    </div>
+  </header>
+  <main class="app-shell">
+    <aside id="session-sidebar" class="sidebar">
+      <div class="sidebar-head"><div><span class="eyebrow">Workspace</span><h2>Test sessions</h2></div><button id="new" class="add-button" aria-label="Add test session">+ New</button></div>
+      <div id="runs" class="run-list"></div>
+      <footer><span id="catalog-count">Loading catalog…</span><small>Sessions stay on this Mac</small></footer>
+    </aside>
+
+    <section class="workspace">
+      <section class="monitoring" aria-label="Live system monitoring">
+        <div class="monitoring-head"><div><span class="eyebrow">System monitor</span><strong>Live hardware</strong></div><span id="metrics-note" class="live-note">Sampling hardware metrics…</span></div>
+        <div class="monitor-grid">
+          <article class="monitor-item monitor-usage"><div><span>CPU</span><strong id="cpu-value">—</strong></div><div class="meter"><i id="cpu-meter"></i></div><small id="cpu-detail">Sampling…</small></article>
+          <article class="monitor-item monitor-usage"><div><span>GPU</span><strong id="gpu-value">—</strong></div><div class="meter"><i id="gpu-meter"></i></div><small id="gpu-detail">Sampling…</small></article>
+          <article class="monitor-item monitor-usage"><div><span>Memory</span><strong id="ram-value">—</strong></div><div class="meter"><i id="ram-meter"></i></div><small id="ram-detail">Sampling…</small></article>
+          <article class="monitor-item monitor-power monitor-total"><span>Total power</span><strong id="power-total">—</strong><small>Entire Mac</small></article>
+          <article class="monitor-item monitor-power"><span>CPU power</span><strong id="power-cpu">—</strong><small>Processor</small></article>
+          <article class="monitor-item monitor-power"><span>GPU power</span><strong id="power-gpu">—</strong><small>Graphics</small></article>
+          <article class="monitor-item monitor-power"><span>Neural Engine</span><strong id="power-ane">—</strong><small>ANE</small></article>
+        </div>
+      </section>
+
+      <section id="empty-state" class="empty-state" hidden>
+        <span class="eyebrow">Ready to test</span>
+        <h1>Create your first session</h1>
+        <p>Choose a prompt, local model, configuration, and project folder. Your test stays completely on this Mac.</p>
+        <button id="empty-new" class="primary">Create test session <span>→</span></button>
+      </section>
+
+      <div id="session-workspace">
+      <div class="page-head">
+        <div><small id="status" class="status">BENCHMARK</small><h1 id="title">Select a test</h1></div>
+        <div class="actions"><button id="start">Start / resume</button><button id="pause">Pause</button><button id="open" class="primary">Open Terminal <span>↗</span></button></div>
+      </div>
+      <div id="session-bar" class="session-bar"><div><span class="eyebrow">Project folder</span><code id="run-path">—</code></div><div><button id="open-folder">Open in Finder <span>↗</span></button><button id="remove-run" class="danger">Remove session</button></div></div>
+
+      <section class="setup-card" aria-label="Test setup">
+        <div class="setup-title"><span class="eyebrow">Test setup</span><p>Choose the runtime and sampling profile used on the next launch.</p></div>
+        <label class="field"><span>Model</span><select id="model" aria-label="Model for selected test"></select></label>
+        <label class="field"><span>Configuration</span><select id="config" aria-label="Configuration for selected test"></select></label>
+        <div class="setup-actions"><button id="edit-config">Edit preset</button></div>
+      </section>
+      </div>
+
+      <section class="quick-suite" aria-label="Quick model suite">
+        <div class="quick-head"><div><span class="eyebrow">Quick benchmark</span><h2>Three-prompt check</h2><p>Instruction, reasoning, and coding. Direct inference without Pi or MCP.</p></div></div>
+        <div class="quick-controls"><label class="field"><span>Model</span><select id="suite-model" aria-label="Quick suite model"></select></label><label class="field"><span>Configuration</span><select id="suite-config" aria-label="Quick suite configuration"></select></label></div>
+        <button id="run-suite" class="primary">Run suite <span>→</span></button>
+        <div id="suite-results" class="suite-results"><p>No quick-suite results yet.</p></div>
+      </section>
+
+      <div id="session-details">
+      <div class="tabs" role="tablist" aria-label="Session details"><button id="files-tab" class="active" role="tab" aria-selected="true" aria-controls="files" data-tab="files">Output files</button><button id="prompt-tab" role="tab" aria-selected="false" aria-controls="prompt" data-tab="prompt">Test prompt</button></div>
+      <div id="files" class="panel" role="tabpanel" aria-labelledby="files-tab"><div id="filelist"></div><pre id="filetext">Select an output file to inspect.</pre></div>
+      <pre id="prompt" class="panel" role="tabpanel" aria-labelledby="prompt-tab" hidden></pre>
+      </div>
+      <div id="notice" role="status" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <dialog id="dialog" class="launch-dialog"><form id="create">
+    <div class="dialog-head launch-head"><div><span class="eyebrow">Launch setup</span><h2>New test session</h2><p>Configure an isolated local workspace. Nothing starts until you launch it.</p></div><button type="button" id="close" class="icon-button" aria-label="Close">×</button></div>
+    <div class="launch-fields"><label class="field" for="picker"><span>Prompt</span><select id="picker"></select></label><label class="field" for="create-model"><span>Model</span><select id="create-model"></select></label><label class="field" for="create-config"><span>Configuration</span><select id="create-config"></select></label></div>
+    <div class="folder-picker launch-folder"><div><span class="eyebrow">Project folder</span><code id="folder-path">—</code><small id="folder-note">A new folder will be created inside the default runs folder.</small></div><div><button type="button" id="choose-folder">Choose folder…</button><button type="button" id="use-default-folder" hidden>Use default</button></div></div>
+    <section class="prompt-preview" aria-label="Selected prompt preview"><div class="preview-head"><div><span class="eyebrow">Prompt preview</span><strong>Instructions sent to Pi</strong></div><span>Read only</span></div><pre id="preview"></pre></section>
+    <div class="launch-footer"><p>Session data stays local. The project folder is preserved if you remove the session.</p><button class="primary launch-submit">Add test session <span>→</span></button></div>
+  </form></dialog>
+  <dialog id="config-dialog"><form id="config-form"><div class="dialog-head"><div><span class="eyebrow">Sampling profile</span><h2>Test configuration</h2></div><button type="button" id="config-close" class="icon-button" aria-label="Close">×</button></div><div class="config-fields"><label class="field"><span>Preset ID</span><input id="cfg-id" required pattern="[a-z0-9-]{1,60}"></label><label class="field"><span>Name</span><input id="cfg-name" required maxlength="80"></label><label class="field"><span>Thinking</span><select id="cfg-thinking"><option>off</option><option>minimal</option><option>low</option><option>medium</option><option>high</option></select></label><label class="field"><span>Context tokens</span><input id="cfg-contextWindow" type="number" min="512" max="262144" required></label><label class="field"><span>Maximum output</span><input id="cfg-maxTokens" type="number" min="1" max="65536" required></label><label class="field"><span>Temperature</span><input id="cfg-temperature" type="number" min="0" max="2" step="0.01" required></label><label class="field"><span>Top-p</span><input id="cfg-topP" type="number" min="0" max="1" step="0.01" required></label></div><p>Changes apply on the next launch. Thinking stays off for models without reasoning support.</p><p id="config-error" role="status"></p><button class="primary full">Save preset</button></form></dialog>
+  <dialog id="settings-dialog" class="settings-dialog"><div class="settings-panel"><div class="dialog-head"><div><span class="eyebrow">LLM Test Lab</span><h2>Settings</h2></div><button type="button" id="settings-close" class="icon-button" aria-label="Close">×</button></div><section class="settings-group"><div><h3>Appearance</h3><p>Follow macOS automatically or keep a fixed appearance.</p></div><div class="theme-picker" role="group" aria-label="Appearance"><button type="button" data-theme-choice="auto"><span class="theme-icon">◐</span><span>Auto<small>System</small></span></button><button type="button" data-theme-choice="light"><span class="theme-icon">○</span><span>Light<small>Bright</small></span></button><button type="button" data-theme-choice="dark"><span class="theme-icon">●</span><span>Dark<small>Dim</small></span></button></div></section><section class="settings-group"><div><h3>Models</h3><p>Add downloaded GGUF files, refresh the local catalog, or find another model on Hugging Face.</p></div><div class="settings-actions"><button id="search-models" class="primary">Add / search model</button><button data-folder="models">Open models folder <span>↗</span></button><button id="refresh-models">Refresh models</button></div></section><section class="settings-group"><div><h3>Configuration presets</h3><p>Create sampling profiles or open their JSON files for advanced changes.</p></div><div class="settings-actions settings-actions-stack"><button id="add-config" class="primary">New preset</button><button data-folder="configs">Open presets folder <span>↗</span></button></div></section><section class="settings-group settings-about"><div><h3>Local workspace</h3><p id="settings-catalog-count">Model and preset catalog loads from this Mac.</p></div></section></div></dialog>
+  <dialog id="model-dialog" class="model-dialog"><div class="model-browser"><div class="dialog-head"><div><span class="eyebrow">Model catalog</span><h2>Search Hugging Face GGUF models</h2></div><button type="button" id="model-close" class="icon-button" aria-label="Close">×</button></div><form id="model-search" class="model-search"><input id="model-query" aria-label="Search Hugging Face models" placeholder="Model name, author, or repository" required minlength="2" maxlength="100"><button class="primary">Search</button></form><p class="browser-note">Repositories can contain many quantizations. Split GGUF shards are grouped and downloaded together.</p><div id="download-status" class="download-status" aria-live="polite"></div><div id="model-results" class="model-results"><p>Search for a public GGUF repository to inspect its available model files.</p></div></div></dialog>
+  <script src="/app.js"></script>
+</body>
+</html>

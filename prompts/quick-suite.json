@@ -1,0 +1,20 @@
+[
+  {
+    "id": "instruction",
+    "name": "Instruction",
+    "maxTokens": 48,
+    "prompt": "Reply with exactly this text and nothing else: QUICK TEST OK"
+  },
+  {
+    "id": "reasoning",
+    "name": "Reasoning",
+    "maxTokens": 96,
+    "prompt": "A shop has 24 notebooks. It sells one quarter of them, then receives 7 more. How many notebooks does it have now? Answer in one short sentence and include the arithmetic."
+  },
+  {
+    "id": "coding",
+    "name": "Coding",
+    "maxTokens": 192,
+    "prompt": "Write a JavaScript function named uniqueSortedNumbers(values) that returns the unique finite numbers from an array in ascending order. Return only the function code."
+  }
+]
