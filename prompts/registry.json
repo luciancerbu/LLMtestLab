@@ -1,0 +1,17 @@
+[
+  {"id":"adherence","file":"adherence.txt","name":"Adherence","category":"instruction","difficulty":"easy","version":1},
+  {"id":"agent-maze","file":"agent-maze.txt","name":"Agent Maze","category":"agentic-app","difficulty":"hard","version":1},
+  {"id":"blender-marble-assets","file":"blender-marble-assets.txt","name":"Blender Marble Assets","category":"creative-tools","difficulty":"hard","version":1},
+  {"id":"breakout","file":"breakout.txt","name":"Breakout","category":"web-app","difficulty":"medium","version":1},
+  {"id":"driving-2d","file":"driving-2d.txt","name":"Driving 2D","category":"web-game","difficulty":"hard","version":1},
+  {"id":"dungeon-game","file":"dungeon-game.txt","name":"Dungeon Game","category":"web-game","difficulty":"hard","version":1},
+  {"id":"expense-tracker","file":"expense-tracker.txt","name":"Expense Tracker","category":"web-app","difficulty":"medium","version":1},
+  {"id":"fake-desktop","file":"fake-desktop.txt","name":"Fake Desktop","category":"web-app","difficulty":"hard","version":1},
+  {"id":"godot-marble-run-3d","file":"godot-marble-run-3d.txt","name":"Godot Marble Run 3D","category":"godot-game","difficulty":"stress","version":1},
+  {"id":"godot-platform-playground-3d","file":"godot-platform-playground-3d.txt","name":"Godot Platform Playground 3D","category":"godot-game","difficulty":"stress","version":1},
+  {"id":"godot-rope-bridge-2d","file":"godot-rope-bridge-2d.txt","name":"Godot Rope Bridge 2D","category":"godot-game","difficulty":"hard","version":1},
+  {"id":"kanban","file":"kanban.txt","name":"Kanban Board","category":"web-app","difficulty":"medium","version":1},
+  {"id":"memory-match","file":"memory-match.txt","name":"Memory Match","category":"web-game","difficulty":"medium","version":1},
+  {"id":"reasoning","file":"reasoning.txt","name":"Reasoning","category":"reasoning","difficulty":"easy","version":1},
+  {"id":"sand-physics","file":"sand-physics.txt","name":"Sand Physics","category":"simulation","difficulty":"hard","version":1}
+]

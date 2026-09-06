@@ -1,0 +1,5 @@
+[
+  {"id":"quick","name":"Quick","description":"One pass through the three core app prompts.","version":1,"repetitions":1,"prompts":["kanban","memory-match","dungeon-game"]},
+  {"id":"full","name":"Full","description":"Three passes for a stable average and variance check.","version":1,"repetitions":3,"prompts":["kanban","memory-match","dungeon-game"]},
+  {"id":"stress","name":"Stress","description":"Five passes to expose thermal throttling and memory pressure.","version":1,"repetitions":5,"prompts":["kanban","memory-match","dungeon-game"]}
+]

@@ -6,6 +6,14 @@ Add one JSON file per model. The id must match the model served by your local in
 {"id":"qwen3:4b-instruct","name":"Qwen 4B","baseUrl":"http://127.0.0.1:11434/v1","reasoning":false,"input":["text"]}
 ```
 
+Optional registry metadata can be declared explicitly:
+
+```json
+{"quantization":"Q4_K_M","contextWindow":32768,"hardware":{"platform":"darwin","architecture":"arm64","accelerator":"Apple Silicon GPU"}}
+```
+
+When omitted, the dashboard infers the provider/runtime and common quantization names where possible, and records `unknown` rather than inventing a value.
+
 Ollama models use port 11434. Model definitions appear alongside the existing Pi Ollama definitions. Choose a separate configuration preset for sampling and token limits.
 
 For a GGUF stored here, add `"runtime":"llama.cpp"`, `"file":"weights.gguf"`, a unique local `baseUrl`, and any supported `serverArgs`. LLM Test Lab starts its llama.cpp server in a separate tmux session on first launch, waits for `/health`, and then starts Pi. Set `LLAMA_SERVER_BIN` when the bundled runtime is absent.

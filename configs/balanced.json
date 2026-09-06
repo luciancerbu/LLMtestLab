@@ -1,9 +1,9 @@
 {
   "id": "balanced",
-  "name": "Balanced",
-  "thinking": "medium",
-  "contextWindow": 16384,
-  "maxTokens": 4096,
+  "name": "custom1",
+  "thinking": "off",
+  "contextWindow": 65000,
+  "maxTokens": 32000,
   "temperature": 0.6,
   "topP": 0.9
 }

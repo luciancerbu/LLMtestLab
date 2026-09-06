@@ -2,70 +2,113 @@ import http from 'node:http';
 import fs from 'node:fs';
 import {systemMetrics} from './metrics.mjs';
 import path from 'node:path';
+import os from 'node:os';
 import {execFile,execFileSync} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
 import {Readable,Transform} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 import {configs,localModels,saveConfig,providerFor,modelDir,configDir,refreshModels} from './catalog.mjs';
 import {ROOT,DATA,PROMPTS,RUNS,PI_MODELS,TMUX,PI,LLAMA_SERVER} from './settings.mjs';
+import {modelMetadata,promptRegistry,suiteRegistry} from './registry.mjs';
+import {publicInferenceServers,remoteModels,removeInferenceServer,saveInferenceServer} from './servers.mjs';
 const PORT=Number(process.env.PORT||4318);
 const AUTONOMOUS_PROMPT='Autonomous benchmark mode is enabled. Work continuously toward the requested outcome, make reasonable in-scope decisions without asking routine questions, use the available tools, and verify the result before stopping. Ask the user only when genuinely blocked, when required information is missing, or before an unsafe or materially out-of-scope action.';
 fs.mkdirSync(DATA,{recursive:true});
-const db=path.join(DATA,'runs.json'),suiteDb=path.join(DATA,'quick-suites.json'),downloadDb=path.join(DATA,'downloads.json'),quickSuiteCases=JSON.parse(fs.readFileSync(path.join(PROMPTS,'quick-suite.json'),'utf8')),origin=`http://127.0.0.1:${PORT}`;
+const promptDefinitions=promptRegistry(),suiteDefinitions=suiteRegistry(),quickSuiteCases=suiteDefinitions.find(suite=>suite.id==='quick').cases;
+const db=path.join(DATA,'runs.json'),suiteDb=path.join(DATA,'quick-suites.json'),downloadDb=path.join(DATA,'downloads.json'),contextDb=path.join(DATA,'context-checks.json'),origin=`http://127.0.0.1:${PORT}`;
 const folderSelections=new Map();
+function gpuLimit(){
+ if(process.platform!=='darwin'||process.arch!=='arm64')return {supported:false,currentMb:null,totalMb:Math.floor(os.totalmem()/1048576),recommendedMaxMb:null};
+ const totalMb=Math.floor(os.totalmem()/1048576),recommendedMaxMb=Math.max(0,totalMb-6144);let currentMb=null;
+ try{currentMb=Number(execFileSync('/usr/sbin/sysctl',['-n','iogpu.wired_limit_mb'],{encoding:'utf8',timeout:1500}).trim())}catch{}
+ return {supported:currentMb!==null,currentMb,totalMb,recommendedMaxMb,resetsOnRestart:true};
+}
+function setGpuLimit(value){
+ const status=gpuLimit();if(!status.supported)throw Error('GPU wired-memory overrides require a supported Apple Silicon Mac.');
+ const mb=Number(value);if(!Number.isInteger(mb)||(mb!==0&&(mb<1024||mb>status.totalMb-4096)))throw Error('Choose 0 for the system default, or leave at least 4 GB for macOS.');
+ const command=`/usr/sbin/sysctl -w iogpu.wired_limit_mb=${mb}`;
+ execFileSync('/usr/bin/osascript',['-e',`do shell script ${JSON.stringify(command)} with administrator privileges`],{encoding:'utf8',timeout:120000});
+ return gpuLimit();
+}
 let runs=fs.existsSync(db)?JSON.parse(fs.readFileSync(db)):[];
 let quickSuites=fs.existsSync(suiteDb)?JSON.parse(fs.readFileSync(suiteDb)):[];
 let downloads=fs.existsSync(downloadDb)?JSON.parse(fs.readFileSync(downloadDb)):[];
+let contextChecks=fs.existsSync(contextDb)?JSON.parse(fs.readFileSync(contextDb)):[];
 runs=runs.map(r=>({...r,config:r.config||'balanced'}));
 const save=()=>fs.writeFileSync(db,JSON.stringify(runs,null,2)); save();
 const saveSuites=()=>fs.writeFileSync(suiteDb,JSON.stringify(quickSuites.slice(0,30),null,2));
 for(const suite of quickSuites)if(['queued','starting','running'].includes(suite.state)){suite.state='interrupted';suite.error='Dashboard restarted before the suite completed.';suite.completedAt=new Date().toISOString()}saveSuites();
 const saveDownloads=()=>fs.writeFileSync(downloadDb,JSON.stringify(downloads.slice(0,30),null,2));
 for(const download of downloads)if(['queued','downloading'].includes(download.state)){download.state='interrupted';download.error='Dashboard restarted before the download completed.';download.completedAt=new Date().toISOString()}saveDownloads();
+const saveContextChecks=()=>fs.writeFileSync(contextDb,JSON.stringify(contextChecks.slice(0,30),null,2));
+for(const check of contextChecks)if(['queued','starting','running'].includes(check.state)){check.state='interrupted';check.error='Dashboard restarted before the context check completed.';check.completedAt=new Date().toISOString()}saveContextChecks();
 const tm=(...args)=>execFileSync(TMUX,args,{encoding:'utf8',timeout:5000,maxBuffer:2e6});
 const quote=s=>"'"+s.replaceAll("'","'\\''")+"'";
-const alive=r=>{try{tm('has-session','-t',r.tmux);return true}catch{return false}};
+const activeIteration=r=>r.kind==='repeated-session'?(r.iterations||[]).find(item=>['starting','running','paused'].includes(item.state))||(r.iterations||[]).filter(item=>item.startedAt).at(-1):null;
+const executionFor=r=>activeIteration(r)||r;
+const alive=r=>{const target=executionFor(r);if(!target?.tmux)return false;try{tm('has-session','-t',target.tmux);return true}catch{return false}};
+function configureTestTmux(name){try{tm('set-option','-t',name,'mouse','on')}catch{}try{tm('set-window-option','-t',name,'history-limit','100000')}catch{}try{tm('set-window-option','-t',name,'remain-on-exit','off')}catch{}}
+const exitFile=r=>path.join(DATA,r.id,'exit-code');
+const agentProgressFile=r=>path.join(DATA,r.id,'progress.json');
+function exitCode(r){try{const value=Number(fs.readFileSync(exitFile(r),'utf8').trim());return Number.isInteger(value)?value:null}catch{return null}}
+function agentProgress(r){try{const file=agentProgressFile(r);if(fs.statSync(file).size>16384)return null;const value=JSON.parse(fs.readFileSync(file,'utf8')),percent=Number(value.percent),phase=String(value.phase||'Working').slice(0,80),summary=String(value.summary||'').slice(0,240);if(value.source==='runner'||(['Starting','Resuming'].includes(phase)&&['Waiting for Pi to create its plan.','Restoring the saved Pi session.'].includes(summary)))return null;if(!Number.isFinite(percent)||percent<0||percent>100)return null;return {percent:Math.round(percent),phase,summary,updatedAt:value.updatedAt&&Number.isFinite(Date.parse(value.updatedAt))?value.updatedAt:null}}catch{return null}}
+function hasSavedSession(r){try{return fs.readdirSync(path.join(DATA,r.id,'sessions')).some(name=>name.endsWith('.jsonl')&&fs.statSync(path.join(DATA,r.id,'sessions',name)).size>0)}catch{return false}}
+function captureHardware(target,sample){const ram=sample.ram||{};target.peakMemoryBytes=Math.max(target.peakMemoryBytes||0,ram.used||0);target.peakGpuMemoryBytes=Math.max(target.peakGpuMemoryBytes||0,ram.gpuInUse||0);target.peakCpuPercent=Math.max(target.peakCpuPercent||0,sample.cpu?.percent||0);target.peakGpuPercent=Math.max(target.peakGpuPercent||0,sample.gpu?.percent||0);target.peakPowerWatts=Math.max(target.peakPowerWatts||0,sample.power?.total||0)}
+function iterationTotals(iterations=[]){const complete=iterations.filter(item=>['complete','failed'].includes(item.state)),rates=complete.map(item=>item.stats?.averageTokensPerSecond).filter(Number.isFinite),times=complete.map(item=>item.elapsedMs).filter(Number.isFinite);return {completed:complete.length,generatedTokens:complete.reduce((sum,item)=>sum+(item.stats?.generatedTokens||0),0),averageTokensPerSecond:rates.length?rates.reduce((sum,value)=>sum+value,0)/rates.length:null,lowTokensPerSecond:rates.length?Math.min(...rates):null,highTokensPerSecond:rates.length?Math.max(...rates):null,averageElapsedMs:times.length?times.reduce((sum,value)=>sum+value,0)/times.length:null,peakMemoryBytes:Math.max(0,...complete.map(item=>item.peakMemoryBytes||0)),peakGpuMemoryBytes:Math.max(0,...complete.map(item=>item.peakGpuMemoryBytes||0))}}
+function runSnapshots(){let changed=false;const sample=systemMetrics(),snapshots=runs.map(r=>{const target=executionFor(r),isAlive=alive(r);if(r.kind==='repeated-session'){if(isAlive&&target?.startedAt){captureHardware(target,sample);target.stats=sessionStats(target.id);target.elapsedMs=Date.now()-Date.parse(target.startedAt);r.elapsedMs=Date.now()-Date.parse(r.startedAt);r.stats=target.stats;r.peakMemoryBytes=target.peakMemoryBytes;r.peakGpuMemoryBytes=target.peakGpuMemoryBytes;changed=true}else if(r.state==='running'){r.state='interrupted';r.error='The dashboard stopped coordinating this series. Start it again to resume the current clean run.';changed=true}r.totals=iterationTotals(r.iterations);return {...r,alive:isAlive,agentProgress:target?agentProgress(target):null,currentIteration:target?.index||null}}if(isAlive&&r.startedAt){captureHardware(r,sample);r.stats=sessionStats(r.id);r.elapsedMs=Date.now()-Date.parse(r.startedAt);changed=true}if(!isAlive&&r.started&&r.state==='running'){const code=exitCode(r);captureHardware(r,sample);r.stats=sessionStats(r.id);r.state=code===null?'stopped':code===0?'complete':'failed';r.exitCode=code;r.completedAt=new Date().toISOString();r.elapsedMs=r.startedAt?Date.parse(r.completedAt)-Date.parse(r.startedAt):null;changed=true}return {...r,alive:isAlive,agentProgress:agentProgress(r)}});if(changed)save();return snapshots}
 function models(){
  try{
   const configured=JSON.parse(fs.readFileSync(PI_MODELS,'utf8')).providers?.ollama?.models||[];
-  const available=configured.filter(m=>m.id).map(m=>({...m,name:m.name||m.id,reasoning:m.reasoning===true,runtime:'ollama',baseUrl:'http://127.0.0.1:11434/v1'}));
-  return [...new Map([...available,...localModels()].map(m=>[m.id,m])).values()];
+  const available=configured.filter(m=>m.id).map(m=>({...m,name:m.name||m.id,reasoning:m.reasoning===true,runtime:'ollama',source:'ollama',sourceId:'ollama-local',sourceName:'Ollama · This Mac',baseUrl:'http://127.0.0.1:11434/v1'}));
+  const managed=localModels().map(m=>({...m,source:'managed',sourceId:'managed-local',sourceName:'Managed GGUF · This Mac'}));
+  return [...new Map([...available,...managed,...remoteModels()].map(m=>[m.id,m])).values()];
  }catch{}
- return localModels();
+ return [...localModels(),...remoteModels()];
 }
 function openTerminal(r){
+ r=executionFor(r);
  if(!alive(r))throw Error('Start or resume this run before opening its tmux session.');
- const command=`${quote(TMUX)} attach-session -t ${quote(r.tmux)}`;
+ configureTestTmux(r.tmux);
+ let target=r.tmux;
+ let startCommand='';try{startCommand=tm('display-message','-p','-t',`${r.tmux}:0`,'#{pane_start_command}')}catch{}
+ if(!startCommand.includes('progress.mjs')){
+  const activityTarget=`${r.tmux}:activity`,windows=tm('list-windows','-t',r.tmux,'-F','#{window_name}').trim().split('\n');
+  if(!windows.includes('activity')){
+   const progress=[process.execPath,path.join(ROOT,'progress.mjs'),path.join(DATA,r.id,'sessions'),exitFile(r)].map(quote).join(' ');
+   tm('new-window','-d','-t',r.tmux,'-n','activity','-c',r.cwd,progress);
+   try{tm('set-window-option','-t',activityTarget,'history-limit','100000')}catch{}
+  }
+  target=activityTarget;
+ }
+ const command=`${quote(TMUX)} attach-session -t ${quote(target)}`;
  const escaped=command.replaceAll('\\','\\\\').replaceAll('"','\\"');
  execFileSync('/usr/bin/osascript',['-e',`tell application "Terminal"\nactivate\ndo script "${escaped}"\nend tell`],{encoding:'utf8',timeout:5000});
 }
 const tmuxAlive=name=>{try{tm('has-session','-t',name);return true}catch{return false}};
+const modelSessionName=model=>'llm-'+model.id.replace(/[^a-zA-Z0-9_-]/g,'-').slice(0,48);
+const effectiveContextWindow=value=>Math.ceil(Number(value)/32)*32;
+function runtimeContext(session){try{const command=tm('display-message','-p','-t',session,'#{pane_start_command}'),matches=[...command.matchAll(/["']?--ctx-size["']?\s+["']?(\d+)/g)];return matches.length?Number(matches.at(-1)[1]):null}catch{return null}}
+function reportedRuntimeContext(model,session=modelSessionName(model)){try{const props=new URL('/props',model.baseUrl).href,payload=execFileSync('/usr/bin/curl',['-fsS','--max-time','1','-H','Authorization: Bearer '+(model.apiKey||'local'),props],{encoding:'utf8',timeout:1500,maxBuffer:1e6}),reported=Number(JSON.parse(payload)?.default_generation_settings?.n_ctx);return Number.isInteger(reported)?reported:runtimeContext(session)}catch{return runtimeContext(session)}}
+function modelIsBusy(modelId){return runs.some(run=>run.model===modelId&&alive(run))||quickSuites.some(suite=>suite.model===modelId&&suite.cases?.some(test=>test.tmux&&tmuxAlive(test.tmux)))}
 function ensureModelRuntime(model,config){
  if(model.runtime!=='llama.cpp')return null;
  if(!model.modelFile)throw Error('The GGUF weight file is missing.');
  if(!fs.existsSync(LLAMA_SERVER))throw Error('llama-server is missing. Set LLAMA_SERVER_BIN or install the bundled runtime.');
- const url=new URL(model.baseUrl),port=Number(url.port||80),session='llm-'+model.id.replace(/[^a-zA-Z0-9_-]/g,'-').slice(0,48);
+ const url=new URL(model.baseUrl),port=Number(url.port||80),session=modelSessionName(model),currentContext=tmuxAlive(session)?reportedRuntimeContext(model,session):null,expectedContext=effectiveContextWindow(config.contextWindow);
+ if(tmuxAlive(session)&&currentContext!==expectedContext){if(modelIsBusy(model.id))throw Error(`This model server is currently in use with a ${currentContext||'different'}-token context. Finish the active test before switching to ${config.contextWindow} tokens.`);tm('kill-session','-t',session)}
  if(!tmuxAlive(session)){
-  const args=[LLAMA_SERVER,'--model',model.modelFile,'--alias',model.id,'--ctx-size',String(config.contextWindow),...(model.serverArgs||[]),'--host',url.hostname,'--port',String(port),'--api-key',model.apiKey||'local'];
+  const args=[LLAMA_SERVER,'--model',model.modelFile,'--alias',model.id,...(model.serverArgs||[]),'--ctx-size',String(config.contextWindow),'--host',url.hostname,'--port',String(port),'--api-key',model.apiKey||'local'];
   tm('new-session','-d','-s',session,'-x','140','-y','35','-c',ROOT,args.map(quote).join(' '));
  }
- return {session,health:new URL('/health',url).href};
+ return {session,health:new URL('/health',url).href,props:new URL('/props',url).href,apiKey:model.apiKey||'local',contextWindow:expectedContext,requestedContext:config.contextWindow};
 }
-const waitForHealth=async url=>{const end=Date.now()+180000;while(Date.now()<end){try{if((await fetch(url,{signal:AbortSignal.timeout(2500)})).ok)return}catch{}await new Promise(resolve=>setTimeout(resolve,1000))}throw Error('The local model server did not become ready within 3 minutes.')};
-const completionUrl=baseUrl=>{const url=new URL(baseUrl);url.pathname=url.pathname.replace(/\/$/,'')+'/chat/completions';return url.href};
-async function runQuickSuite(suite,model,config){
+async function runContextCheck(check){
  try{
-  suite.state='starting';suite.startedAt=new Date().toISOString();saveSuites();
-  const runtime=ensureModelRuntime(model,config);if(runtime)await waitForHealth(runtime.health);
-  suite.state='running';suite.results=[];saveSuites();
-  for(const test of quickSuiteCases){
-   const started=Date.now(),response=await fetch(completionUrl(model.baseUrl),{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(model.apiKey||'local')},body:JSON.stringify({model:model.id,messages:[{role:'user',content:test.prompt}],temperature:config.temperature,top_p:config.topP,max_tokens:Math.min(test.maxTokens,config.maxTokens),stream:false}),signal:AbortSignal.timeout(600000)});
-   const raw=await response.text();let payload;try{payload=JSON.parse(raw)}catch{throw Error('Model server returned an invalid response.')}if(!response.ok)throw Error(payload.error?.message||payload.error||'Model request failed with HTTP '+response.status);
-   const usage=payload.usage||{},elapsedMs=Date.now()-started;
-   suite.results.push({id:test.id,name:test.name,elapsedMs,promptTokens:Number.isFinite(usage.prompt_tokens)?usage.prompt_tokens:null,completionTokens:Number.isFinite(usage.completion_tokens)?usage.completion_tokens:null,totalTokens:Number.isFinite(usage.total_tokens)?usage.total_tokens:null,output:payload.choices?.[0]?.message?.content||'',finishReason:payload.choices?.[0]?.finish_reason||null});saveSuites();
-  }
-  const sum=key=>suite.results.every(r=>Number.isFinite(r[key]))?suite.results.reduce((n,r)=>n+r[key],0):null;suite.state='complete';suite.completedAt=new Date().toISOString();suite.elapsedMs=new Date(suite.completedAt)-new Date(suite.startedAt);suite.totals={promptTokens:sum('promptTokens'),completionTokens:sum('completionTokens'),totalTokens:sum('totalTokens')};saveSuites();
- }catch(error){suite.state='failed';suite.error=error.message;suite.completedAt=new Date().toISOString();suite.elapsedMs=new Date(suite.completedAt)-new Date(suite.startedAt);saveSuites()}
+  const model=models().find(item=>item.id===check.model),config=configs().find(item=>item.id===check.config);if(!model||!config)throw Error('The selected model or configuration is no longer available.');if(model.runtime!=='llama.cpp')throw Error('Runtime context checks currently require a local GGUF model served by llama.cpp.');
+  check.state='starting';check.startedAt=new Date().toISOString();const baseline=systemMetrics();check.baselineMemoryBytes=baseline.ram?.used||null;check.peakMemoryBytes=check.baselineMemoryBytes||0;check.peakGpuMemoryBytes=baseline.ram?.gpuInUse||0;check.peakGpuAllocatedBytes=baseline.ram?.gpuAllocated||0;saveContextChecks();const runtime=ensureModelRuntime(model,config),deadline=Date.now()+120000;
+  check.state='running';saveContextChecks();let reported=null;while(Date.now()<deadline){const sample=systemMetrics();check.peakMemoryBytes=Math.max(check.peakMemoryBytes||0,sample.ram?.used||0);check.peakGpuMemoryBytes=Math.max(check.peakGpuMemoryBytes||0,sample.ram?.gpuInUse||0);check.peakGpuAllocatedBytes=Math.max(check.peakGpuAllocatedBytes||0,sample.ram?.gpuAllocated||0);if(!tmuxAlive(runtime.session))throw Error('The model server exited while loading this context. Reduce the context size or memory pressure.');try{const response=await fetch(runtime.health,{headers:{Authorization:'Bearer '+runtime.apiKey},signal:AbortSignal.timeout(1500)});if(response.ok){reported=reportedRuntimeContext(model,runtime.session);if(reported)break}}catch{}await delay(1000)}
+  if(!reported)throw Error('The model server did not become ready within two minutes.');if(reported<config.contextWindow)throw Error(`llama-server loaded ${reported.toLocaleString()} tokens, below the requested ${config.contextWindow.toLocaleString()}.`);const finalSample=systemMetrics();check.peakMemoryBytes=Math.max(check.peakMemoryBytes||0,finalSample.ram?.used||0);check.peakGpuMemoryBytes=Math.max(check.peakGpuMemoryBytes||0,finalSample.ram?.gpuInUse||0);check.peakGpuAllocatedBytes=Math.max(check.peakGpuAllocatedBytes||0,finalSample.ram?.gpuAllocated||0);check.reportedContext=reported;check.state='complete';check.completedAt=new Date().toISOString();check.elapsedMs=Date.parse(check.completedAt)-Date.parse(check.startedAt);saveContextChecks();
+ }catch(error){check.state='failed';check.error=error.message;check.completedAt=new Date().toISOString();check.elapsedMs=check.startedAt?Date.parse(check.completedAt)-Date.parse(check.startedAt):0;saveContextChecks()}
 }
 const validRepo=repo=>typeof repo==='string'&&/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo);
 const validHfFile=file=>typeof file==='string'&&file.toLowerCase().endsWith('.gguf')&&!file.startsWith('/')&&!file.split('/').includes('..');
@@ -73,7 +116,7 @@ const hfJson=async url=>{const response=await fetch(url,{headers:{'User-Agent':'
 function ggufGroups(siblings=[]){const groups=new Map();for(const item of siblings){const file=item.rfilename;if(!validHfFile(file)||/(^|\/)(mmproj|imatrix|mtp-)/i.test(file))continue;const split=file.match(/^(.*)-(\d{5})-of-(\d{5})\.gguf$/i),key=split?split[1]+'.gguf':file;if(!groups.has(key))groups.set(key,{name:key.split('/').pop().replace(/\.gguf$/i,''),files:[],totalBytes:0});const size=item.size||item.lfs?.size||null,group=groups.get(key);group.files.push({path:file,size});if(size)group.totalBytes+=size}return [...groups.values()].map(group=>({...group,files:group.files.sort((a,b)=>a.path.localeCompare(b.path))})).sort((a,b)=>a.name.localeCompare(b.name))}
 async function searchHuggingFace(query){const url=new URL('https://huggingface.co/api/models');url.searchParams.set('search',query);url.searchParams.set('filter','gguf');url.searchParams.set('sort','downloads');url.searchParams.set('direction','-1');url.searchParams.set('limit','8');const found=await hfJson(url);return Promise.all(found.map(async model=>{const detail=await hfJson(`https://huggingface.co/api/models/${model.id}?blobs=true`);return {id:model.id,downloads:model.downloads||0,likes:model.likes||0,lastModified:model.lastModified||null,url:`https://huggingface.co/${model.id}`,groups:ggufGroups(detail.siblings)}}))}
 async function downloadHuggingFace(job){try{job.state='downloading';saveDownloads();const detail=await hfJson(`https://huggingface.co/api/models/${job.repo}?blobs=true`),available=new Map((detail.siblings||[]).map(file=>[file.rfilename,file]));for(const file of job.files)if(!available.has(file)||!validHfFile(file))throw Error('The selected GGUF file is no longer available.');job.totalBytes=job.files.reduce((sum,file)=>sum+(available.get(file).size||available.get(file).lfs?.size||0),0);const repoFolder=path.join(modelDir,'downloads',job.repo.replace('/','--'));for(const file of job.files){job.currentFile=file;const expected=available.get(file).size||available.get(file).lfs?.size||0,destination=path.resolve(repoFolder,file),root=path.resolve(repoFolder)+path.sep;if(!destination.startsWith(root))throw Error('Invalid download path.');fs.mkdirSync(path.dirname(destination),{recursive:true});if(fs.existsSync(destination)){const size=fs.statSync(destination).size;if(!expected||size===expected){job.downloadedBytes+=size;saveDownloads();continue}throw Error('A different file already exists at '+destination)}const temporary=destination+'.download';if(fs.existsSync(temporary))fs.rmSync(temporary);const url='https://huggingface.co/'+job.repo+'/resolve/main/'+file.split('/').map(encodeURIComponent).join('/')+'?download=true',response=await fetch(url,{redirect:'follow',headers:{'User-Agent':'LLMTestLab/1.0'},signal:AbortSignal.timeout(3600000)});if(!response.ok||!response.body)throw Error('Download failed with HTTP '+response.status);let lastSaved=0;const meter=new Transform({transform(chunk,encoding,callback){job.downloadedBytes+=chunk.length;if(Date.now()-lastSaved>1000){lastSaved=Date.now();saveDownloads()}callback(null,chunk)}});try{await pipeline(Readable.fromWeb(response.body),meter,fs.createWriteStream(temporary,{flags:'wx'}));if(expected&&fs.statSync(temporary).size!==expected)throw Error('Downloaded size does not match the Hugging Face file metadata.');fs.renameSync(temporary,destination);saveDownloads()}catch(error){if(fs.existsSync(temporary))fs.rmSync(temporary);throw error}}job.refresh=refreshModels();job.state='complete';job.currentFile=null;job.completedAt=new Date().toISOString();saveDownloads()}catch(error){job.state='failed';job.error=error.message;job.completedAt=new Date().toISOString();saveDownloads()}}
-const prompts=()=>fs.readdirSync(PROMPTS).filter(n=>n.endsWith('.txt')).map(name=>({name,text:fs.readFileSync(path.join(PROMPTS,name),'utf8')}));
+const prompts=()=>promptDefinitions.map(prompt=>({...prompt,name:prompt.file,displayName:prompt.name}));
 function launch(r){
  const model=models().find(m=>m.id===r.model),config=configs().find(c=>c.id===r.config);
  if(!model||!config)throw Error('Select an available model and configuration.');
@@ -82,13 +125,60 @@ function launch(r){
  const provider=providerFor(model,config);
  const runtime=ensureModelRuntime(model,config);
  fs.writeFileSync(extension,'export default function(pi){pi.registerProvider("bench-local",'+JSON.stringify(provider)+')}\n');
+ const resultFile=exitFile(r);fs.rmSync(resultFile,{force:true});
+ const progressFile=agentProgressFile(r),previousProgress=agentProgress(r);fs.writeFileSync(progressFile,JSON.stringify({version:1,percent:previousProgress?.percent||0,phase:r.started?'Resuming':'Starting',summary:r.started?'Restoring the saved Pi session.':'Waiting for Pi to create its plan.',updatedAt:new Date().toISOString(),source:'runner'},null,2));
  r.launchConfig={model:r.model,configuration:config,baseUrl:provider.baseUrl,runtime:model.runtime||'external',modelServer:runtime?.session||null,mode:'autonomous'};
- const args=[PI,'--extension',extension,'--provider','bench-local','--model',r.model,'--thinking',model.reasoning?config.thinking:'off','--approve','--offline','--append-system-prompt',AUTONOMOUS_PROMPT,'--session-dir',path.join(DATA,r.id,'sessions'),'--name',r.name];
- if(r.sessionFile)args.push('--session',r.sessionFile,'Continue from saved progress. Verify current files and finish the benchmark.');
- else if(r.started)args.push('--continue','Continue from saved progress. Verify current files and finish the benchmark.');
- else args.push('@'+path.join(PROMPTS,r.prompt),'Execute the benchmark in this project. Work in small steps, keep progress in TASKS.md, and verify the result.');
- const command=(runtime?`until /usr/bin/curl -fsS --max-time 2 ${quote(runtime.health)} >/dev/null 2>&1; do sleep 1; done; `:'')+'exec '+args.map(quote).join(' ');
- tm('new-session','-d','-s',r.tmux,'-x','160','-y','45','-c',r.cwd,command);r.state='running';r.started=true;save();
+ const progressPrompt=`Report your own progress to ${progressFile} so the local benchmark dashboard can display it. Write valid JSON with exactly these fields: {"version":1,"percent":number,"phase":string,"summary":string,"updatedAt":ISO-8601 string}. Estimate percent from 0 to 100 based on completion of the requested deliverable, not token usage or elapsed time. Update it after planning, after each meaningful milestone, whenever the plan changes, and immediately before your final response. Keep phase under 80 characters and summary under 240 characters. The estimate may change when you discover new work, but do not report 100 until implementation and verification are complete. This progress file is dashboard metadata, not part of the requested project deliverables.`;
+ const args=[PI,'--print','--extension',extension,'--provider','bench-local','--model',model.providerModelId||model.id,'--thinking',model.reasoning?config.thinking:'off','--approve','--offline','--append-system-prompt',AUTONOMOUS_PROMPT+' '+progressPrompt,'--session-dir',path.join(DATA,r.id,'sessions'),'--name',r.name];
+ const progressFirst=`Before doing any other work, write your initial progress estimate to ${progressFile} using the required progress JSON schema. Continue updating it at every meaningful milestone.`;
+ if(r.sessionFile)args.push('--session',r.sessionFile,progressFirst+' Continue from saved progress. Verify current files and finish the benchmark.');
+ else if(r.started&&hasSavedSession(r))args.push('--continue',progressFirst+' Continue from saved progress. Verify current files and finish the benchmark.');
+ else args.push('@'+path.join(PROMPTS,r.prompt),progressFirst+' Execute the benchmark in this project. Work in small steps, keep progress in TASKS.md, and verify the result.');
+ const healthCheck=runtime?`/usr/bin/curl -fsS --connect-timeout 1 --max-time 1 -H ${quote('Authorization: Bearer '+runtime.apiKey)} ${quote(runtime.health)}`:null;
+ const runtimeReady=runtime?`{ for attempt in $(/usr/bin/seq 1 60); do ${healthCheck} >/dev/null 2>&1 && break; sleep 1; done; ${healthCheck} >/dev/null 2>&1 || { /usr/bin/printf 'Model server did not become ready within two minutes. Reduce the context size or GPU memory pressure and try again.\\n' >&2; false; }; } && { context_payload=$(/usr/bin/curl -fsS --max-time 2 -H ${quote('Authorization: Bearer '+runtime.apiKey)} ${quote(runtime.props)}); /usr/bin/printf '%s' "$context_payload" | /usr/bin/grep -Eq ${quote('"n_ctx"[[:space:]]*:[[:space:]]*'+runtime.contextWindow)} || { /usr/bin/printf 'Model server did not apply the requested %s-token context. Adjust the preset or GPU memory limit.\\n' ${quote(String(runtime.contextWindow))} >&2; false; }; }`:'true';
+ const sessionDir=path.join(DATA,r.id,'sessions'),progress=[process.execPath,path.join(ROOT,'progress.mjs'),sessionDir].map(quote).join(' '),piCommand=args.map(quote).join(' ');
+ const header=`/usr/bin/printf '\\033[2J\\033[HLLM Test Lab\\n\\nSession: %s\\nModel: %s\\nContext: %s tokens\\n\\n[00:00] Checking the model server...\\n' ${quote(r.name)} ${quote(model.name)} ${quote(Number(config.contextWindow).toLocaleString('en-US'))}`;
+ const command=`${header}; if ${runtimeReady}; then ${progress} & progress_pid=$!; ${piCommand}; result=$?; kill "$progress_pid" >/dev/null 2>&1 || true; wait "$progress_pid" >/dev/null 2>&1 || true; else result=$?; fi; if [ "$result" -eq 0 ]; then /usr/bin/printf '\\nCompleted successfully. This tmux session will now close.\\n'; else /usr/bin/printf '\\nStopped with exit code %s.\\n' "$result" >&2; fi; /usr/bin/printf '%s\\n' "$result" > ${quote(resultFile)}; exit "$result"`;
+ tm('new-session','-d','-s',r.tmux,'-x','160','-y','45','-c',r.cwd,command);configureTestTmux(r.tmux);r.state='running';r.started=true;r.startedAt=new Date().toISOString();r.attempt=(r.attempt||0)+1;r.peakMemoryBytes=0;r.peakGpuMemoryBytes=0;r.peakCpuPercent=0;r.peakGpuPercent=0;r.peakPowerWatts=0;delete r.exitCode;delete r.completedAt;save();
+}
+const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+function sessionStats(runId){
+ const dir=path.join(DATA,runId,'sessions');if(!fs.existsSync(dir))return {generatedTokens:0,inputTokens:0,cacheReadTokens:0,responseCount:0,modelTimeMs:0,averageTokensPerSecond:null,lowTokensPerSecond:null,highTokensPerSecond:null};
+ const rows=[];for(const name of fs.readdirSync(dir).filter(name=>name.endsWith('.jsonl'))){for(const line of fs.readFileSync(path.join(dir,name),'utf8').split('\n')){if(!line.trim())continue;try{rows.push(JSON.parse(line))}catch{}}}
+ let generatedTokens=0,inputTokens=0,cacheReadTokens=0,modelTimeMs=0,timedGeneratedTokens=0;const rates=[];let lastAssistant=null;
+ for(let i=0;i<rows.length;i++){const row=rows[i];if(row.type!=='message'||row.message?.role!=='assistant'||!row.message.usage)continue;lastAssistant=row;const output=Number(row.message.usage.output)||0;generatedTokens+=output;inputTokens+=Number(row.message.usage.input)||0;cacheReadTokens+=Number(row.message.usage.cacheRead)||0;const start=Date.parse(rows[i-1]?.timestamp),end=Date.parse(row.timestamp),elapsed=end-start;if(output>0&&elapsed>0){modelTimeMs+=elapsed;timedGeneratedTokens+=output;rates.push(output/(elapsed/1000))}}
+ return {generatedTokens,timedGeneratedTokens,inputTokens,cacheReadTokens,responseCount:rates.length,modelTimeMs,latestTokensPerSecond:rates.length?rates.at(-1):null,averageTokensPerSecond:modelTimeMs?timedGeneratedTokens/(modelTimeMs/1000):null,lowTokensPerSecond:rates.length?Math.min(...rates):null,highTokensPerSecond:rates.length?Math.max(...rates):null,lastStopReason:lastAssistant?.message?.stopReason||null,lastError:lastAssistant?.message?.errorMessage||null};
+}
+function sampleSuiteCase(test){
+ const sample=systemMetrics(),ram=sample.ram||{};captureHardware(test,sample);test.peakGpuAllocatedBytes=Math.max(test.peakGpuAllocatedBytes||0,ram.gpuAllocated||0);test.stats=sessionStats(test.runId);test.agentProgress=agentProgress({id:test.runId});test.elapsedMs=Date.now()-Date.parse(test.startedAt);
+}
+function suiteTotals(suite){
+ const cases=suite.cases||[],stats=cases.map(test=>test.stats||{}),generatedTokens=stats.reduce((sum,item)=>sum+(item.generatedTokens||0),0),timedGeneratedTokens=stats.reduce((sum,item)=>sum+(item.timedGeneratedTokens||0),0),inputTokens=stats.reduce((sum,item)=>sum+(item.inputTokens||0),0),cacheReadTokens=stats.reduce((sum,item)=>sum+(item.cacheReadTokens||0),0),modelTimeMs=stats.reduce((sum,item)=>sum+(item.modelTimeMs||0),0),rates=stats.flatMap(item=>[item.lowTokensPerSecond,item.highTokensPerSecond]).filter(Number.isFinite);
+ return {generatedTokens,inputTokens,cacheReadTokens,modelTimeMs,averageTokensPerSecond:modelTimeMs?timedGeneratedTokens/(modelTimeMs/1000):null,lowTokensPerSecond:rates.length?Math.min(...rates):null,highTokensPerSecond:rates.length?Math.max(...rates):null,peakMemoryBytes:Math.max(0,...cases.map(item=>item.peakMemoryBytes||0)),peakGpuMemoryBytes:Math.max(0,...cases.map(item=>item.peakGpuMemoryBytes||0)),peakGpuAllocatedBytes:Math.max(0,...cases.map(item=>item.peakGpuAllocatedBytes||0)),peakCpuPercent:Math.max(0,...cases.map(item=>item.peakCpuPercent||0)),peakGpuPercent:Math.max(0,...cases.map(item=>item.peakGpuPercent||0)),peakPowerWatts:Math.max(0,...cases.map(item=>item.peakPowerWatts||0))};
+}
+async function runRepeatedSession(parent){
+ try{
+  parent.started=true;parent.state='running';parent.startedAt=parent.startedAt||new Date().toISOString();parent.completedAt=null;parent.error=null;save();
+  for(const iteration of parent.iterations){
+   if(iteration.state==='complete')continue;
+   if(parent.pauseRequested){parent.state='paused';save();return}
+   if(!iteration.startedAt)fs.mkdirSync(iteration.cwd,{recursive:false});iteration.state='starting';iteration.startedAt=iteration.startedAt||new Date().toISOString();save();
+   launch(iteration);iteration.state='running';save();
+   while(alive(iteration)){const sample=systemMetrics();captureHardware(iteration,sample);iteration.stats=sessionStats(iteration.id);iteration.elapsedMs=Date.now()-Date.parse(iteration.startedAt);parent.stats=iteration.stats;parent.elapsedMs=Date.now()-Date.parse(parent.startedAt);parent.totals=iterationTotals(parent.iterations);save();await delay(2000)}
+   const sample=systemMetrics();captureHardware(iteration,sample);iteration.stats=sessionStats(iteration.id);iteration.exitCode=exitCode(iteration);iteration.completedAt=new Date().toISOString();iteration.elapsedMs=Date.parse(iteration.completedAt)-Date.parse(iteration.startedAt);iteration.state=iteration.exitCode===0&&!iteration.stats?.lastError?'complete':'failed';if(iteration.state==='failed')iteration.error=iteration.stats?.lastError||`Pi exited with status ${iteration.exitCode??'unknown'}.`;parent.totals=iterationTotals(parent.iterations);save();
+   if(iteration.state==='failed'){parent.state='partial';parent.error=`Run ${iteration.index} failed. Remaining repetitions were not started.`;break}
+  }
+  if(parent.state==='running')parent.state=parent.iterations.every(item=>item.state==='complete')?'complete':'partial';parent.completedAt=new Date().toISOString();parent.elapsedMs=Date.parse(parent.completedAt)-Date.parse(parent.startedAt);parent.stats=parent.iterations.at(-1)?.stats||parent.stats;parent.totals=iterationTotals(parent.iterations);save();
+ }catch(error){parent.state='failed';parent.error=error.message;parent.completedAt=new Date().toISOString();parent.elapsedMs=parent.startedAt?Date.parse(parent.completedAt)-Date.parse(parent.startedAt):0;save()}
+}
+async function runProjectSuite(suite){
+ suite.state='running';suite.startedAt=new Date().toISOString();saveSuites();
+ for(const definition of suite.plan||quickSuiteCases){
+  const runId=randomUUID(),test={id:definition.id,name:definition.name,prompt:definition.promptFile,runId,cwd:path.join(RUNS,'suite-'+suite.id.slice(0,8),definition.id),tmux:'pi-suite-'+runId.slice(0,8),state:'queued',grade:null,startedAt:null,completedAt:null,elapsedMs:null,baselineMemoryBytes:null,peakMemoryBytes:0,peakGpuMemoryBytes:0,peakGpuAllocatedBytes:0,stats:sessionStats(runId)};suite.cases.push(test);suite.currentCase=definition.id;fs.mkdirSync(test.cwd,{recursive:true});saveSuites();
+  const run={id:runId,name:'suite-'+definition.id,prompt:definition.promptFile,model:suite.model,config:suite.config,cwd:test.cwd,customFolder:false,tmux:test.tmux,created:new Date().toISOString(),state:'queued'};
+  try{const baseline=systemMetrics();test.baselineMemoryBytes=baseline.ram?.used||null;test.state='starting';test.startedAt=new Date().toISOString();saveSuites();launch(run);test.state='running';saveSuites();while(alive(run)){sampleSuiteCase(test);suite.elapsedMs=Date.now()-Date.parse(suite.startedAt);suite.totals=suiteTotals(suite);saveSuites();await delay(2000)}sampleSuiteCase(test);test.exitCode=exitCode(run);test.completedAt=new Date().toISOString();test.elapsedMs=Date.parse(test.completedAt)-Date.parse(test.startedAt);const outputFiles=files(test.cwd);test.outputFiles=outputFiles.length;test.entryFile=outputFiles.find(file=>file.name==='index.html')?.name||outputFiles.find(file=>file.name.endsWith('.html'))?.name||null;test.state=test.exitCode!==0||test.stats.lastStopReason==='error'||test.stats.lastError||!test.entryFile?'failed':'complete';if(test.state==='failed')test.error=test.stats.lastError||(test.exitCode===null?'The benchmark terminal ended without a completion status.':test.exitCode!==0?'Pi exited with status '+test.exitCode+'.':!test.entryFile?'Pi finished without creating a launchable HTML app.':'Pi stopped with an error.')}catch(error){test.state='failed';test.error=error.message;test.completedAt=new Date().toISOString();test.elapsedMs=test.startedAt?Date.parse(test.completedAt)-Date.parse(test.startedAt):0}suite.elapsedMs=Date.now()-Date.parse(suite.startedAt);suite.totals=suiteTotals(suite);saveSuites();
+ }
+ suite.currentCase=null;suite.completedAt=new Date().toISOString();suite.elapsedMs=Date.parse(suite.completedAt)-Date.parse(suite.startedAt);suite.state=suite.cases.every(test=>test.state==='complete')?'complete':'partial';suite.totals=suiteTotals(suite);saveSuites();
 }
 function files(dir,base=dir,depth=0){if(depth>4)return [];return fs.readdirSync(dir,{withFileTypes:true}).filter(e=>!e.name.startsWith('.')&&!['addons','node_modules'].includes(e.name)).flatMap(e=>{let p=path.join(dir,e.name);return e.isSymbolicLink()?[]:e.isDirectory()?files(p,base,depth+1):[{name:path.relative(base,p),size:fs.statSync(p).size}] }).slice(0,300)}
 async function body(req){let s='';for await(const c of req){s+=c;if(s.length>20000)throw Error('Request too large')}return JSON.parse(s||'{}')}
@@ -98,9 +188,15 @@ http.createServer(async(req,res)=>{try{
  if(![`127.0.0.1:${PORT}`,`localhost:${PORT}`].includes(req.headers.host))return json(res,{error:'Invalid host'},403);
  if(req.method!=='GET'&&(![origin,`http://localhost:${PORT}`].includes(req.headers.origin)||!req.headers['content-type']?.startsWith('application/json')))return json(res,{error:'Same-origin JSON required'},403);
  const u=new URL(req.url,origin);
- if(req.method==='GET'&&u.pathname==='/api/state')return json(res,{prompts:prompts(),models:models().map(({modelFile,serverArgs,apiKey,...m})=>m),configs:configs(),runs:runs.map(r=>({...r,alive:alive(r)})),quickSuiteCases:quickSuiteCases.map(({prompt,...test})=>test),quickSuites:quickSuites.slice(0,12),downloads:downloads.slice(0,10),defaultRunFolder:RUNS,system:systemMetrics()});
- if(req.method==='POST'&&u.pathname==='/api/quick-suites'){const b=await body(req),model=models().find(m=>m.id===b.model),config=configs().find(c=>c.id===b.config);if(!model||!config)throw Error('Select an available model and configuration.');if(quickSuites.some(s=>['queued','starting','running'].includes(s.state)))throw Error('A quick suite is already running.');const suite={id:randomUUID(),model:model.id,modelName:model.name,config:config.id,configName:config.name,state:'queued',createdAt:new Date().toISOString(),results:[]};quickSuites.unshift(suite);saveSuites();void runQuickSuite(suite,model,config);return json(res,suite,202)}
+ if(req.method==='GET'&&u.pathname==='/api/state')return json(res,{prompts:prompts(),models:models().map(({modelFile,serverArgs,apiKey,...m})=>({...m,metadata:modelMetadata(m),activeContext:m.runtime==='llama.cpp'&&tmuxAlive(modelSessionName(m))?reportedRuntimeContext({...m,apiKey}):null})),servers:publicInferenceServers(),configs:configs(),runs:runSnapshots(),suiteDefinitions:suiteDefinitions.map(suite=>({...suite})),quickSuiteCases:quickSuiteCases.map(test=>({...test})),quickSuites:quickSuites.slice(0,12),downloads:downloads.slice(0,10),contextChecks:contextChecks.slice(0,10),defaultRunFolder:RUNS,system:systemMetrics(),gpuLimit:gpuLimit()});
+ if(req.method==='POST'&&u.pathname==='/api/servers')return json(res,await saveInferenceServer(await body(req)));
+ const serverMatch=u.pathname.match(/^\/api\/servers\/([^/]+)\/remove$/);if(req.method==='POST'&&serverMatch){if(runs.some(run=>run.model?.startsWith('remote:'+serverMatch[1]+':')&&alive(run)))throw Error('Finish the active test using this server before removing it.');return json(res,removeInferenceServer(serverMatch[1]))}
+ if(req.method==='POST'&&u.pathname==='/api/system/gpu-limit')return json(res,setGpuLimit((await body(req)).mb));
+ if(req.method==='POST'&&u.pathname==='/api/quick-suites'){const b=await body(req),model=models().find(m=>m.id===b.model),config=configs().find(c=>c.id===b.config),definition=suiteDefinitions.find(suite=>suite.id===(b.suite||'quick'));if(!model||!config)throw Error('Select an available model and configuration.');if(!definition)throw Error('Select a benchmark suite.');if(quickSuites.some(s=>['queued','starting','running'].includes(s.state)))throw Error('A benchmark suite is already running.');if(runs.some(alive))throw Error('Pause or finish active single sessions before starting a benchmark so its speed and memory results remain accurate.');const suite={id:randomUUID(),kind:'project-suite',suiteId:definition.id,suiteName:definition.name,suiteVersion:definition.version,repetitions:definition.repetitions,plan:definition.cases.map(test=>({...test})),model:model.id,modelName:model.name,modelSnapshot:modelMetadata(model,config),config:config.id,configName:config.name,configuration:{...config},state:'queued',createdAt:new Date().toISOString(),cases:[],totals:null};quickSuites.unshift(suite);saveSuites();void runProjectSuite(suite);return json(res,suite,202)}
+ const suiteMatch=u.pathname.match(/^\/api\/quick-suites\/([^/]+)\/cases\/([^/]+)\/(open|finder|grade)$/);
+ if(suiteMatch){const suite=quickSuites.find(item=>item.id===suiteMatch[1]),test=suite?.cases?.find(item=>item.id===suiteMatch[2]);if(!suite||!test)throw Error('Unknown benchmark result.');const action=suiteMatch[3];if(req.method==='POST'&&action==='grade'){if(test.state!=='complete')throw Error('Finish this app before grading it.');const grade=Number((await body(req)).grade);if(!Number.isInteger(grade)||grade<1||grade>5)throw Error('Grade must be between 1 and 5.');test.grade=grade;test.gradedAt=new Date().toISOString();saveSuites();return json(res,test)}if(req.method==='POST'&&action==='finder'){execFileSync('/usr/bin/open',[test.cwd]);return json(res,{ok:true})}if(req.method==='POST'&&action==='open'){const entry=test.entryFile||files(test.cwd).map(file=>file.name).find(name=>name==='index.html')||files(test.cwd).map(file=>file.name).find(name=>name.endsWith('.html'));if(!entry)throw Error('No HTML app was found yet. Open the project folder to inspect its files.');execFileSync('/usr/bin/open',[path.join(test.cwd,entry)]);return json(res,{ok:true})}}
  if(req.method==='POST'&&u.pathname==='/api/models/refresh')return json(res,refreshModels());
+ if(req.method==='POST'&&u.pathname==='/api/models/context-check'){const b=await body(req),model=models().find(item=>item.id===b.model),config=configs().find(item=>item.id===b.config);if(!model||!config)throw Error('Select an available model and configuration.');if(model.runtime!=='llama.cpp')throw Error('Context checks are available for local GGUF models.');if(runs.some(alive)||quickSuites.some(suite=>['queued','starting','running'].includes(suite.state)))throw Error('Finish or remove active tests before loading a model for a clean memory check.');if(contextChecks.some(check=>['queued','starting','running'].includes(check.state)))throw Error('A context check is already running.');if(model.contextWindow&&config.contextWindow>model.contextWindow)throw Error(`This preset exceeds the model metadata limit of ${model.contextWindow.toLocaleString()} tokens.`);const check={id:randomUUID(),model:model.id,modelName:model.name,config:config.id,configName:config.name,requestedContext:config.contextWindow,declaredContext:model.contextWindow||null,modelBytes:model.fileBytes||null,state:'queued',createdAt:new Date().toISOString(),reportedContext:null,baselineMemoryBytes:null,peakMemoryBytes:null,peakGpuMemoryBytes:null,peakGpuAllocatedBytes:null};contextChecks.unshift(check);saveContextChecks();void runContextCheck(check);return json(res,check,202)}
  if(req.method==='GET'&&u.pathname==='/api/huggingface/search'){const query=(u.searchParams.get('q')||'').trim();if(query.length<2||query.length>100)throw Error('Enter between 2 and 100 characters.');return json(res,{results:await searchHuggingFace(query)});}
  if(req.method==='POST'&&u.pathname==='/api/huggingface/download'){const b=await body(req);if(!validRepo(b.repo)||!Array.isArray(b.files)||!b.files.length||b.files.length>20||!b.files.every(validHfFile))throw Error('Invalid Hugging Face selection.');if(downloads.some(d=>['queued','downloading'].includes(d.state)))throw Error('A model download is already running.');const job={id:randomUUID(),repo:b.repo,name:String(b.name||b.files[0]).slice(0,160),files:b.files,state:'queued',createdAt:new Date().toISOString(),downloadedBytes:0,totalBytes:Number(b.totalBytes)||0};downloads.unshift(job);saveDownloads();void downloadHuggingFace(job);return json(res,job,202)}
  if(req.method==='POST'&&u.pathname==='/api/configs')return json(res,saveConfig(await body(req)));
@@ -110,19 +206,21 @@ http.createServer(async(req,res)=>{try{
  const b=await body(req),p=prompts().find(p=>p.name===b.prompt);if(!p)throw Error('Unknown prompt');
  if(!models().some(m=>m.id===b.model))throw Error('Unknown or unavailable Ollama model');
  if(!configs().some(c=>c.id===b.config))throw Error('Select a configuration');
- const id=randomUUID(),picked=folderSelections.get(b.folderToken);if(b.folderToken&&(!picked||picked.expires<=Date.now()))throw Error('Folder selection expired. Choose the folder again.');const selection=b.folderToken?picked:null,cwd=selection?.folder||path.join(RUNS,id);folderSelections.delete(b.folderToken);fs.mkdirSync(cwd,{recursive:true});
- const r={id,name:b.prompt.replace('.txt',''),prompt:b.prompt,model:b.model,config:b.config,cwd,customFolder:!!selection,tmux:'pi-bench-'+id.slice(0,8),created:new Date().toISOString(),state:'queued'};runs.unshift(r);save();return json(res,r);
+ const repetitions=Number(b.repetitions||1);if(!Number.isInteger(repetitions)||repetitions<1||repetitions>10)throw Error('Choose between 1 and 10 repetitions.');
+ const id=randomUUID(),picked=folderSelections.get(b.folderToken);if(b.folderToken&&(!picked||picked.expires<=Date.now()))throw Error('Folder selection expired. Choose the folder again.');const selection=b.folderToken?picked:null,base=selection?.folder||RUNS,cwd=repetitions>1?path.join(base,'llm-test-'+id.slice(0,8)):(selection?.folder||path.join(RUNS,id));folderSelections.delete(b.folderToken);fs.mkdirSync(cwd,{recursive:true});
+ const model=models().find(model=>model.id===b.model),configuration=configs().find(config=>config.id===b.config),common={name:p.displayName,prompt:b.prompt,model:b.model,config:b.config},r={id,...common,promptSnapshot:{id:p.id,name:p.displayName,file:p.file,category:p.category,difficulty:p.difficulty,version:p.version,hash:p.hash,hashAlgorithm:p.hashAlgorithm},modelSnapshot:modelMetadata(model,configuration),configurationSnapshot:{...configuration},cwd,customFolder:!!selection,tmux:'pi-bench-'+id.slice(0,8),created:new Date().toISOString(),state:'queued',repetitions};if(repetitions>1){r.kind='repeated-session';r.iterations=Array.from({length:repetitions},(_,index)=>{const iterationId=randomUUID();return {id:iterationId,index:index+1,...common,name:`${p.displayName} · Run ${index+1}`,cwd:path.join(cwd,'run-'+String(index+1).padStart(2,'0')),customFolder:false,tmux:'pi-repeat-'+iterationId.slice(0,8),created:new Date().toISOString(),state:'queued'}})}runs.unshift(r);save();return json(res,r);
  }
  const m=u.pathname.match(/^\/api\/runs\/([^/]+)(?:\/(files|file|start|continue|pause|open|finder|remove|model|config))?$/);
  if(m){const r=runs.find(r=>r.id===m[1]);if(!r)throw Error('Unknown run');const action=m[2];
- if(req.method==='GET'&&action==='files')return json(res,files(r.cwd));
- if(req.method==='GET'&&action==='file'){const p=path.resolve(r.cwd,u.searchParams.get('name')||'');if(!p.startsWith(r.cwd+path.sep)||!fs.realpathSync(p).startsWith(fs.realpathSync(r.cwd)+path.sep))throw Error('Invalid path');if(fs.statSync(p).size>500000)throw Error('File too large');return json(res,{text:fs.readFileSync(p,'utf8')});}
- if(req.method==='POST'&&action==='start'){if(alive(r))throw Error('Session already running');launch(r);return json(res,r);}
- if(req.method==='POST'&&action==='continue'){if(!alive(r))throw Error('Session is not running');tm('send-keys','-t',r.tmux,'-l','Continue the benchmark from current progress and verify the result.');tm('send-keys','-t',r.tmux,'Enter');r.state='running';save();return json(res,r);}
- if(req.method==='POST'&&action==='pause'){if(alive(r))tm('send-keys','-t',r.tmux,'Escape');r.state='paused';save();return json(res,r);}
+ const target=executionFor(r),outputRoot=r.kind==='repeated-session'?(target?.cwd||r.cwd):r.cwd;
+ if(req.method==='GET'&&action==='files')return json(res,files(outputRoot));
+ if(req.method==='GET'&&action==='file'){const p=path.resolve(outputRoot,u.searchParams.get('name')||'');if(!p.startsWith(outputRoot+path.sep)||!fs.realpathSync(p).startsWith(fs.realpathSync(outputRoot)+path.sep))throw Error('Invalid path');if(fs.statSync(p).size>500000)throw Error('File too large');return json(res,{text:fs.readFileSync(p,'utf8')});}
+ if(req.method==='POST'&&action==='start'){if(alive(r))throw Error('Session already running');if(r.kind==='repeated-session'){if(r.started&&!['paused','interrupted'].includes(r.state))throw Error('This repeated benchmark has already run. Create a new session for another clean comparison.');r.pauseRequested=false;void runRepeatedSession(r);return json(res,r,202)}launch(r);return json(res,r);}
+ if(req.method==='POST'&&action==='continue'){if(!alive(r))throw Error('Session is not running');tm('send-keys','-t',target.tmux,'-l','Continue the benchmark from current progress and verify the result.');tm('send-keys','-t',target.tmux,'Enter');r.state='running';r.pauseRequested=false;target.state='running';save();return json(res,r);}
+ if(req.method==='POST'&&action==='pause'){if(alive(r))tm('send-keys','-t',target.tmux,'Escape');r.state='paused';r.pauseRequested=true;if(target&&target!==r)target.state='paused';save();return json(res,r);}
  if(req.method==='POST'&&action==='open'){openTerminal(r);return json(res,{ok:true});}
  if(req.method==='POST'&&action==='finder'){if(!fs.existsSync(r.cwd))throw Error('The project folder no longer exists.');execFileSync('/usr/bin/open',[r.cwd]);return json(res,{ok:true});}
- if(req.method==='POST'&&action==='remove'){if(alive(r))tm('kill-session','-t',r.tmux);runs=runs.filter(x=>x.id!==r.id);save();return json(res,{ok:true,cwd:r.cwd,filesPreserved:true});}
+ if(req.method==='POST'&&action==='remove'){if(alive(r))tm('kill-session','-t',target.tmux);runs=runs.filter(x=>x.id!==r.id);save();return json(res,{ok:true,cwd:r.cwd,filesPreserved:true});}
  if(req.method==='POST'&&action==='config'){if(alive(r))throw Error('Configuration changes apply to stopped or new runs.');const b=await body(req);if(!configs().some(c=>c.id===b.config))throw Error('Unknown configuration');r.config=b.config;save();return json(res,r);}
  if(req.method==='POST'&&action==='model'){if(alive(r))throw Error('Pause or stop the run before changing its model.');const b=await body(req);if(!models().some(m=>m.id===b.model))throw Error('Unknown or unavailable Ollama model');r.model=b.model;save();return json(res,r);}
  }
