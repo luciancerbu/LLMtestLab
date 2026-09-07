@@ -29,11 +29,16 @@ export function refreshModels(){
 }
 export function configs(){return fs.readdirSync(configDir).filter(f=>f.endsWith('.json')).map(f=>validateConfig(JSON.parse(fs.readFileSync(path.join(configDir,f),'utf8'))))}
 export function validateConfig(c){
+ c={topK:40,minP:0.05,...c};
  if(!/^[a-z0-9-]{1,60}$/.test(c.id)||typeof c.name!=='string'||!c.name.trim()||c.name.length>80)throw Error('Use a short name and an ID containing lowercase letters, numbers or hyphens.');
  if(!['off','minimal','low','medium','high'].includes(c.thinking))throw Error('Invalid thinking level');
- for(const [key,min,max] of [['contextWindow',512,1048576],['maxTokens',1,131072],['temperature',0,2],['topP',0,1]])if(typeof c[key]!=='number'||!Number.isFinite(c[key])||c[key]<min||c[key]>max)throw Error('Invalid '+key);
+ const optionalNumber=(key,min,max,integer=false)=>{if(c[key]===undefined||c[key]===null||c[key]==='')return null;const value=Number(c[key]);if(!Number.isFinite(value)||value<min||value>max||(integer&&!Number.isInteger(value)))throw Error('Invalid '+key);return value};
+ for(const [key,min,max] of [['contextWindow',512,1048576],['maxTokens',1,131072],['temperature',0,2],['topP',0,1],['topK',0,1000],['minP',0,1]])if(typeof c[key]!=='number'||!Number.isFinite(c[key])||c[key]<min||c[key]>max)throw Error('Invalid '+key);
  if(!Number.isInteger(c.contextWindow)||!Number.isInteger(c.maxTokens)||c.maxTokens>=c.contextWindow)throw Error('Output tokens must be smaller than the context window.');
- return {id:c.id,name:c.name,thinking:c.thinking,contextWindow:c.contextWindow,maxTokens:c.maxTokens,temperature:c.temperature,topP:c.topP};
+ const parallel=optionalNumber('parallel',1,128,true),fitTarget=optionalNumber('fitTarget',1,1048576,true),specDraftMax=optionalNumber('specDraftMax',0,64,true),fit=c.fit??'inherit',specType=c.specType??'inherit';
+ if(!['inherit','on','off'].includes(fit))throw Error('Invalid fit mode');
+ if(!['inherit','none','draft-simple','draft-eagle3','draft-mtp','draft-dflash','draft-dspark','ngram-simple','ngram-map-k','ngram-map-k4v','ngram-mod','ngram-cache'].includes(specType))throw Error('Invalid speculative decoding type');
+ return {id:c.id,name:c.name.trim(),thinking:c.thinking,contextWindow:c.contextWindow,maxTokens:c.maxTokens,temperature:c.temperature,topP:c.topP,topK:c.topK,minP:c.minP,parallel,fit,fitTarget,specType,specDraftMax};
 }
 export function localModels(){return fs.readdirSync(modelDir).filter(f=>f.endsWith('.json')).map(f=>{
  const m=JSON.parse(fs.readFileSync(path.join(modelDir,f),'utf8'));
@@ -48,4 +53,4 @@ export function localModels(){return fs.readdirSync(modelDir).filter(f=>f.endsWi
  return {...m,name:m.name||m.id,baseUrl:url.href,reasoning:m.reasoning===true,modelFile,fileBytes,contextWindow};
 })}
 export function saveConfig(c){c=validateConfig(c);fs.writeFileSync(path.join(configDir,c.id+'.json'),JSON.stringify(c,null,2)+'\n');return c}
-export function providerFor(model,config){return {api:'openai-completions',baseUrl:model.baseUrl||'http://127.0.0.1:11434/v1',apiKey:model.apiKey||'local',models:[{id:model.providerModelId||model.id,name:model.name,reasoning:model.reasoning,input:model.input||['text'],contextWindow:config.contextWindow,maxTokens:config.maxTokens,cost:{input:0,output:0,cacheRead:0,cacheWrite:0},samplingParams:{temperature:config.temperature,top_p:config.topP}}]}}
+export function providerFor(model,config){return {api:'openai-completions',baseUrl:model.baseUrl||'http://127.0.0.1:11434/v1',apiKey:model.apiKey||'local',models:[{id:model.providerModelId||model.id,name:model.name,reasoning:model.reasoning,input:model.input||['text'],contextWindow:config.contextWindow,maxTokens:config.maxTokens,cost:{input:0,output:0,cacheRead:0,cacheWrite:0},samplingParams:{temperature:config.temperature,top_p:config.topP,top_k:config.topK,min_p:config.minP}}]}}
