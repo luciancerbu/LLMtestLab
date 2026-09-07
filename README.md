@@ -159,12 +159,12 @@ Before a clean suite or context check, Test Lab now:
 
 1. refuses to interrupt a managed model that an active test still uses;
 2. unloads idle managed GGUF servers;
-3. restarts the selected model with the exact runtime profile;
+3. waits for the previous model port to be released, then restarts the selected model with the exact runtime profile;
 4. verifies the context reported by `llama-server`;
-5. sends a roughly 6K-token decode probe;
-6. records peak unified, active GPU, and allocated GPU memory.
+5. measures prefill and generation speed at 25%, 50%, and 75% context fill;
+6. records minimum free memory, swap growth, and peak unified/GPU memory.
 
-This catches profiles that can open `/health` but fail during actual Metal computation. A context check is only marked **Pass** after decoding succeeds.
+This catches profiles that can open `/health` but fail or slow sharply during actual Metal computation. A context check is only marked **Pass** after all three generation samples succeed with usable memory headroom.
 
 The launcher shows the model's declared limit, selected context, currently loaded context, and latest fit result before a run begins.
 
@@ -241,6 +241,14 @@ With `macmon` installed, the dashboard samples:
 - CPU, GPU, neural-engine, and total system power.
 
 The readings are system-wide. Close unrelated heavy workloads before comparisons.
+
+### Context stress test
+
+**Test context fit** opens a preflight dialog before using the model. The context entered there is temporary: the saved preset is not changed unless the user explicitly saves a result.
+
+The test cold-starts the managed llama.cpp runtime, measures 64-token generation at approximately 25%, 50%, and 75% of the requested context, and records the prefill and decode rate for every step. It also records minimum free memory, peak system/GPU memory, swap growth, and runtime stability. Its summary shows the resulting speed curve, reports **pass**, **warning**, or **unsafe**, and offers to save either the tested context or the safer recommendation to the selected preset.
+
+This is intentionally heavier than a health check and can take several minutes. It cannot run alongside a benchmark. The progress dialog includes the latest completed prefill and generation rates, their change versus the 25% baseline, live GPU load, GPU allocation, unified-memory use, free memory, and swap use. It shows **Measuring…** until the first reliable speed sample exists rather than presenting zero as a result. Closing the dialog does not stop the server-side test: reopen it from **View context test**. Only **Stop test** aborts it, and completed summaries remain available from **View last context test**.
 
 On supported Apple Silicon Macs, **Settings → GPU memory limit** can temporarily change `iogpu.wired_limit_mb`. macOS requests administrator approval, Test Lab reserves at least 4 GB for the system, and the override resets after a reboot. A larger limit does not pre-allocate memory and can reduce system stability.
 

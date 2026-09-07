@@ -48,6 +48,33 @@ const saveContextChecks=()=>fs.writeFileSync(contextDb,JSON.stringify(contextChe
 for(const check of contextChecks)if(['queued','starting','running'].includes(check.state)){check.state='interrupted';check.error='Dashboard restarted before the context check completed.';check.completedAt=new Date().toISOString()}saveContextChecks();
 const tm=(...args)=>execFileSync(TMUX,args,{encoding:'utf8',timeout:5000,maxBuffer:2e6});
 const quote=s=>"'"+s.replaceAll("'","'\\''")+"'";
+const syncPause=milliseconds=>Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,milliseconds);
+function localRequestText(url,{method='GET',headers={},body='',signal,timeoutMs=1800000}={}){
+ return new Promise((resolve,reject)=>{
+  const request=http.request(url,{method,headers:{...headers,...(body?{'Content-Length':Buffer.byteLength(body)}:{})},signal},response=>{
+   response.setEncoding('utf8');let text='';
+   response.on('data',chunk=>{text+=chunk;if(text.length>2e6)request.destroy(Error('The model server returned an unexpectedly large response.'))});
+   response.on('end',()=>resolve({ok:response.statusCode>=200&&response.statusCode<300,status:response.statusCode||0,text}));
+  });
+  request.on('error',reject);
+  request.setTimeout(timeoutMs,()=>{const error=Error(`The model server did not return this sample within ${Math.round(timeoutMs/60000)} minutes.`);error.code='STRESS_SAMPLE_TIMEOUT';request.destroy(error)});
+  request.end(body);
+ });
+}
+function contextStressFailure(check,error){
+ const technical=String(error?.message||'Unknown context-test error.'),code=error?.cause?.code||error?.code||null,percent=check.currentStep?[25,50,75][check.currentStep-1]:null,tokens=Number(check.targetTokens||check.promptTokens||0),completed=check.speedSamples?.length||0;
+ check.errorCode=code;check.technicalError=code?`${technical} (${code})`:technical;
+ if(code==='STRESS_SAMPLE_TIMEOUT')return `The ${percent||'current'}% context sample exceeded its ${Math.round((check.sampleTimeoutMs||1800000)/60000)}-minute limit while processing ${tokens.toLocaleString()} prompt tokens. ${completed?`${completed} earlier sample${completed===1?' completed':'s completed'} successfully. `:''}Try a smaller context or run the test again after freeing memory.`;
+ if(technical==='fetch failed'||code==='UND_ERR_HEADERS_TIMEOUT')return `The ${percent||'current'}% context sample reached ${tokens.toLocaleString()} prompt tokens, but the dashboard connection timed out before generation results returned. ${completed?`The ${completed===1?'25% sample':'earlier samples'} completed successfully. `:''}The model server may still be healthy; run the test again.`;
+ if(['ECONNRESET','ECONNREFUSED','EPIPE'].includes(code))return `The connection to the model server was interrupted during the ${percent||'current'}% context sample at ${tokens.toLocaleString()} prompt tokens. ${completed?`${completed} earlier sample${completed===1?' completed':'s completed'} successfully. `:''}Check that the model server is still running, then retry.`;
+ return technical;
+}
+function portBusy(port){try{execFileSync('/usr/sbin/lsof',['-nP','-iTCP:'+port,'-sTCP:LISTEN','-t'],{stdio:'ignore',timeout:500});return true}catch{return false}}
+function waitForPortRelease(model,timeoutMs=5000){
+ const port=Number(new URL(model.baseUrl).port||80),deadline=Date.now()+timeoutMs;
+	 while(Date.now()<deadline){if(!portBusy(port))return;syncPause(100)}
+ throw Error('Port '+port+' is still in use after stopping the previous model server. Wait a few seconds and try again.');
+}
 const activeIteration=r=>r.kind==='repeated-session'?(r.iterations||[]).find(item=>['starting','running','paused'].includes(item.state))||(r.iterations||[]).filter(item=>item.startedAt).at(-1):null;
 const executionFor=r=>activeIteration(r)||r;
 const alive=r=>{const target=executionFor(r);if(!target?.tmux)return false;try{tm('has-session','-t',target.tmux);return true}catch{return false}};
@@ -123,7 +150,7 @@ function releaseIdleManagedRuntimes(selectedModelId,{restartSelected=false}={}){
   if(candidate.id===selectedModelId&&!restartSelected)continue;
   const session=modelSessionName(candidate);if(!tmuxAlive(session))continue;
   if(modelIsBusy(candidate.id))throw Error(`The managed model ${candidate.name} is still in use. Finish its active test before loading another large model.`);
-  tm('kill-session','-t',session);
+	  tm('kill-session','-t',session);waitForPortRelease(candidate);
  }
 }
 function ensureModelRuntime(model,config){
@@ -132,9 +159,10 @@ function ensureModelRuntime(model,config){
  if(!fs.existsSync(LLAMA_SERVER))throw Error('llama-server is missing. Set LLAMA_SERVER_BIN or install the bundled runtime.');
  releaseIdleManagedRuntimes(model.id);
  const url=new URL(model.baseUrl),port=Number(url.port||80),session=modelSessionName(model),serverArgs=managedServerArgs(model,config),profile=runtimeProfile(model,serverArgs),currentContext=tmuxAlive(session)?reportedRuntimeContext(model,session):null,expectedContext=effectiveContextWindow(config.contextWindow),profileChanged=tmuxAlive(session)&&savedRuntimeProfile(model)!==profile;
- if(tmuxAlive(session)&&(currentContext!==expectedContext||profileChanged)){if(modelIsBusy(model.id))throw Error(`This model server is currently in use with different runtime settings. Finish the active test before applying this preset.`);tm('kill-session','-t',session)}
- if(!tmuxAlive(session)){
-  const args=[LLAMA_SERVER,'--model',model.modelFile,'--alias',model.id,...serverArgs,'--host',url.hostname,'--port',String(port),'--api-key',model.apiKey||'local'];
+	 if(tmuxAlive(session)&&(currentContext!==expectedContext||profileChanged)){if(modelIsBusy(model.id))throw Error(`This model server is currently in use with different runtime settings. Finish the active test before applying this preset.`);tm('kill-session','-t',session);waitForPortRelease(model)}
+	 if(!tmuxAlive(session)){
+	  if(portBusy(port))throw Error('Port '+port+' is already used by another process. Stop that process or change this model’s base URL before retrying.');
+	  const args=[LLAMA_SERVER,'--model',model.modelFile,'--alias',model.id,...serverArgs,'--host',url.hostname,'--port',String(port),'--api-key',model.apiKey||'local'];
   tm('new-session','-d','-s',session,'-x','140','-y','35','-c',ROOT,args.map(quote).join(' '));
   fs.mkdirSync(runtimeProfileDir,{recursive:true});fs.writeFileSync(runtimeProfileFile(model),profile);
  }
@@ -150,6 +178,66 @@ async function runContextCheck(check){
   if(!probe.ok){let detail=probeText;try{detail=JSON.parse(probeText)?.error?.message||detail}catch{}throw Error('The model loaded but failed its decode probe: '+String(detail||`HTTP ${probe.status}`).slice(0,500))}
   const finalSample=systemMetrics();check.peakMemoryBytes=Math.max(check.peakMemoryBytes||0,finalSample.ram?.used||0);check.peakGpuMemoryBytes=Math.max(check.peakGpuMemoryBytes||0,finalSample.ram?.gpuInUse||0);check.peakGpuAllocatedBytes=Math.max(check.peakGpuAllocatedBytes||0,finalSample.ram?.gpuAllocated||0);check.reportedContext=reported;check.state='complete';check.completedAt=new Date().toISOString();check.elapsedMs=Date.parse(check.completedAt)-Date.parse(check.startedAt);saveContextChecks();
  }catch(error){check.state='failed';check.error=error.message;check.completedAt=new Date().toISOString();check.elapsedMs=check.startedAt?Date.parse(check.completedAt)-Date.parse(check.startedAt):0;saveContextChecks()}
+}
+const contextCheckControllers=new Map();
+function sampleUsefulContextCheck(check){
+ const sample=systemMetrics(),ram=sample.ram||{};
+ check.peakMemoryBytes=Math.max(check.peakMemoryBytes||0,ram.used||0);
+ check.peakGpuMemoryBytes=Math.max(check.peakGpuMemoryBytes||0,ram.gpuInUse||0);
+ check.peakGpuAllocatedBytes=Math.max(check.peakGpuAllocatedBytes||0,ram.gpuAllocated||0);
+ if(Number.isFinite(ram.available))check.minimumAvailableBytes=Math.min(check.minimumAvailableBytes??ram.available,ram.available);
+ if(Number.isFinite(ram.swapUsed))check.peakSwapBytes=Math.max(check.peakSwapBytes??ram.swapUsed,ram.swapUsed);
+}
+async function runUsefulContextCheck(check,testConfig){
+ const controller=new AbortController();
+ contextCheckControllers.set(check.id,controller);
+ let monitor;
+ try{
+  const model=models().find(item=>item.id===check.model);
+  if(!model||!testConfig)throw Error('The selected model or configuration is no longer available.');
+  check.state='starting';check.phase='Cold-starting model';check.percent=5;check.startedAt=new Date().toISOString();
+  const baseline=systemMetrics(),ram=baseline.ram||{};
+  check.baselineMemoryBytes=ram.used||null;check.baselineSwapBytes=ram.swapUsed||0;check.peakMemoryBytes=ram.used||0;check.peakGpuMemoryBytes=ram.gpuInUse||0;check.peakGpuAllocatedBytes=ram.gpuAllocated||0;check.minimumAvailableBytes=ram.available??null;check.peakSwapBytes=ram.swapUsed??null;
+  saveContextChecks();
+  const runtime=ensureModelRuntime(model,testConfig),deadline=Date.now()+180000;
+  check.runtimeSession=runtime.session;check.state='running';check.phase='Loading requested context';check.percent=15;saveContextChecks();
+  monitor=setInterval(()=>{sampleUsefulContextCheck(check);saveContextChecks()},2000);
+  let reported=null;
+  while(Date.now()<deadline){
+   if(controller.signal.aborted)throw controller.signal.reason||Error('Stopped by user.');
+   if(!tmuxAlive(runtime.session))throw Error('The model server exited while loading this context.');
+   try{const response=await fetch(runtime.health,{headers:{Authorization:'Bearer '+runtime.apiKey},signal:AbortSignal.timeout(1500)});if(response.ok){reported=reportedRuntimeContext(model,runtime.session);if(reported)break}}catch{}
+   await delay(1000);
+  }
+  if(!reported)throw Error('The model server did not become ready within three minutes.');
+  if(reported<testConfig.contextWindow)throw Error('llama-server reduced the context to '+reported.toLocaleString()+' tokens.');
+	  check.reportedContext=reported;check.phase='Calibrating speed curve';check.percent=22;saveContextChecks();
+	  const tokenizeUrl=new URL('/tokenize',model.baseUrl),completionUrl=new URL('/v1/chat/completions',model.baseUrl),headers={Authorization:'Bearer '+runtime.apiKey,'Content-Type':'application/json'},unit=' context-fit';
+	  const tokenized=await fetch(tokenizeUrl,{method:'POST',headers,body:JSON.stringify({content:unit.repeat(256),add_special:false}),signal:AbortSignal.any([controller.signal,AbortSignal.timeout(30000)])});
+	  if(!tokenized.ok)throw Error('The runtime could not tokenize the stress prompt.');
+	  const unitCount=(await tokenized.json()).tokens?.length||256,fractions=[.25,.5,.75];check.speedSamples=[];check.decodeTokens=64;
+	  for(let index=0;index<fractions.length;index++){
+	   if(controller.signal.aborted)throw controller.signal.reason||Error('Stopped by user.');
+	   const fraction=fractions[index],target=Math.max(1024,Math.min(Math.floor(testConfig.contextWindow*fraction),testConfig.contextWindow-1024)),repeats=Math.max(1,Math.floor(target*256/unitCount)),content=`speed-curve-${index+1} `+unit.repeat(repeats),started=Date.now(),measuredPrefill=check.speedSamples.at(-1)?.prefillTokensPerSecond,estimatedMs=Math.ceil(target/(measuredPrefill>0?measuredPrefill:60)*1000+60000),sampleTimeoutMs=Math.max(600000,Math.min(3600000,estimatedMs*3));
+	   check.currentStep=index+1;check.promptTokens=target;check.targetTokens=target;check.sampleStartedAt=new Date(started).toISOString();check.estimatedSampleMs=estimatedMs;check.sampleTimeoutMs=sampleTimeoutMs;check.phase='Measuring '+Math.round(fraction*100)+'% context token speed';check.percent=28+index*20;saveContextChecks();
+		   const requestBody=JSON.stringify({model:model.providerModelId||model.id,messages:[{role:'user',content:content+'\nReply with a concise confirmation that this context-speed sample completed.'}],max_tokens:64,temperature:0,stream:false,cache_prompt:false}),response=await localRequestText(completionUrl,{method:'POST',headers,body:requestBody,signal:controller.signal,timeoutMs:sampleTimeoutMs}),responseText=response.text;
+	   if(!response.ok){let detail=responseText;try{detail=JSON.parse(responseText)?.error?.message||detail}catch{}throw Error('Context speed sample failed: '+String(detail||('HTTP '+response.status)).slice(0,500))}
+	   let result={};try{result=JSON.parse(responseText)}catch{}
+	   const promptTokens=Number(result.timings?.prompt_n)||Number(result.usage?.prompt_tokens)||target,prefillTokensPerSecond=Number(result.timings?.prompt_per_second)||null,decodeTokensPerSecond=Number(result.timings?.predicted_per_second)||null,decodeTokens=Number(result.timings?.predicted_n)||Number(result.usage?.completion_tokens)||null;
+	   check.promptTokens=promptTokens;check.prefillTokensPerSecond=prefillTokensPerSecond;check.decodeTokensPerSecond=decodeTokensPerSecond;check.actualDecodeTokens=decodeTokens;check.speedSamples.push({contextPercent:Math.round(fraction*100),contextTokens:promptTokens,prefillTokensPerSecond,decodeTokensPerSecond,decodeTokens,elapsedMs:Date.now()-started});sampleUsefulContextCheck(check);saveContextChecks();
+	  }
+	  check.phase='Measuring memory headroom';check.percent=90;sampleUsefulContextCheck(check);await delay(2000);sampleUsefulContextCheck(check);
+	  const headroom=check.minimumAvailableBytes??0,swapGrowth=Math.max(0,(check.peakSwapBytes||0)-(check.baselineSwapBytes||0)),warningHeadroom=2*1024**3,unsafeHeadroom=1024**3,firstSpeed=check.speedSamples[0]?.decodeTokensPerSecond,lastSpeed=check.speedSamples.at(-1)?.decodeTokensPerSecond,speedRatio=firstSpeed>0&&lastSpeed>0?lastSpeed/firstSpeed:1;
+	  check.swapGrowthBytes=swapGrowth;
+	  check.generationSlowdownPercent=Math.max(0,Math.round((1-speedRatio)*100));
+	  check.verdict=headroom<unsafeHeadroom||swapGrowth>512*1024**2||speedRatio<.5?'unsafe':headroom<warningHeadroom||swapGrowth>128*1024**2||speedRatio<.75?'warning':'pass';
+	  check.recommendedContext=check.verdict==='pass'?testConfig.contextWindow:Math.max(8192,Math.floor((testConfig.contextWindow*(check.verdict==='unsafe'?.5:.75))/1024)*1024);
+	  const speedNote=check.generationSlowdownPercent?' Generation slowed '+check.generationSlowdownPercent+'% between the 25% and 75% samples.':'';
+	  check.summary=(check.verdict==='pass'?'All context-speed samples completed with usable headroom.':check.verdict==='warning'?'The samples completed, but memory, swap, or generation-speed headroom is tight.':'The context technically ran, but memory pressure or severe generation slowdown makes it unsafe for long agent sessions.')+speedNote;
+  check.phase='Complete';check.percent=100;check.state='complete';check.completedAt=new Date().toISOString();check.elapsedMs=Date.parse(check.completedAt)-Date.parse(check.startedAt);saveContextChecks();
+ }catch(error){
+	  check.state=controller.signal.aborted?'stopped':'failed';check.phase=check.state==='stopped'?'Stopped':'Failed';check.error=controller.signal.aborted?'Stopped by user.':contextStressFailure(check,error);check.summary=check.error;check.completedAt=new Date().toISOString();check.elapsedMs=check.startedAt?Date.parse(check.completedAt)-Date.parse(check.startedAt):0;saveContextChecks();
+ }finally{clearInterval(monitor);contextCheckControllers.delete(check.id)}
 }
 const validRepo=repo=>typeof repo==='string'&&/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo);
 const validHfFile=file=>typeof file==='string'&&file.toLowerCase().endsWith('.gguf')&&!file.startsWith('/')&&!file.split('/').includes('..');
@@ -287,6 +375,21 @@ http.createServer(async(req,res)=>{try{
  const suiteMatch=u.pathname.match(/^\/api\/quick-suites\/([^/]+)\/cases\/([^/]+)\/(open|terminal|finder|grade|revise)$/);
  if(suiteMatch){const suite=quickSuites.find(item=>item.id===suiteMatch[1]),test=suite?.cases?.find(item=>item.id===suiteMatch[2]);if(!suite||!test)throw Error('Unknown benchmark result.');const action=suiteMatch[3];if(req.method==='POST'&&action==='grade'){if(test.state!=='complete')throw Error('Finish this app before grading it.');const grade=Number((await body(req)).grade);if(!Number.isInteger(grade)||grade<1||grade>5)throw Error('Grade must be between 1 and 5.');test.grade=grade;test.gradedAt=new Date().toISOString();saveSuites();return json(res,test)}if(req.method==='POST'&&action==='revise'){if(!['complete','failed'].includes(test.state))throw Error('This app must finish before it can be revised.');if(runs.some(alive)||quickSuites.some(item=>item.cases?.some(entry=>entry.tmux&&tmuxAlive(entry.tmux))))throw Error('Finish the active benchmark before starting a revision.');if(!hasSavedSession({id:test.runId}))throw Error('The saved Pi conversation for this app is unavailable.');const payload=await body(req),mode=payload.mode==='custom'?'custom':'normal',custom=String(payload.instructions||'').trim();if(mode==='custom'&&(custom.length<2||custom.length>4000))throw Error('Describe the problem in 2 to 4,000 characters.');const instructions=mode==='custom'?`The user reviewed the generated app and found these problems:\n\n${custom}\n\nInspect the existing project, fix every reported issue, finish incomplete work, and verify the app before stopping.`:'The user reviewed the generated app and says it does not work or is not finished. Inspect the current project critically, identify incomplete or broken behavior, repair it, and verify the app before stopping.';void runSuiteRevision(suite,test,instructions,mode);return json(res,{ok:true,promptCount:(test.promptCount||1)+1},202)}if(req.method==='POST'&&action==='terminal'){openTerminal({...test,id:test.runId});return json(res,{ok:true})}if(req.method==='POST'&&action==='finder'){execFileSync('/usr/bin/open',[test.cwd]);return json(res,{ok:true})}if(req.method==='POST'&&action==='open'){const entry=test.entryFile||files(test.cwd).map(file=>file.name).find(name=>name==='index.html')||files(test.cwd).map(file=>file.name).find(name=>name.endsWith('.html'));if(!entry)throw Error('No HTML app was found yet. Open the project folder to inspect its files.');execFileSync('/usr/bin/open',[path.join(test.cwd,entry)]);return json(res,{ok:true})}}
  if(req.method==='POST'&&u.pathname==='/api/models/refresh')return json(res,refreshModels());
+ if(req.method==='POST'&&u.pathname==='/api/context-fit-checks'){
+  if(runs.some(alive)||quickSuites.some(suite=>suite.cases?.some(test=>test.tmux&&tmuxAlive(test.tmux))))throw Error('Finish the active benchmark before running a context stress test.');
+  if(contextChecks.some(check=>['queued','starting','running','stopping'].includes(check.state)))throw Error('A context test is already running.');
+  const payload=await body(req),model=models().find(item=>item.id===payload.model),config=configs().find(item=>item.id===payload.config),contextWindow=Number(payload.contextWindow);
+  if(!model||!config)throw Error('Select an available model and configuration.');
+  if(model.runtime!=='llama.cpp')throw Error('Context stress tests require a managed local GGUF model.');
+  if(!Number.isInteger(contextWindow)||contextWindow<4096||contextWindow>1048576)throw Error('Choose a context between 4,096 and 1,048,576 tokens.');
+  if(model.contextWindow&&contextWindow>model.contextWindow)throw Error('The requested context exceeds the model limit of '+model.contextWindow.toLocaleString()+' tokens.');
+  if(config.maxTokens>=contextWindow)throw Error('The context must be larger than the preset maximum response.');
+  releaseIdleManagedRuntimes(model.id,{restartSelected:true});
+  const check={id:randomUUID(),kind:'stress',model:model.id,modelName:model.name,config:config.id,configName:config.name,requestedContext:contextWindow,declaredContext:model.contextWindow||null,modelBytes:model.fileBytes||null,state:'queued',phase:'Queued',percent:0,createdAt:new Date().toISOString()};
+  contextChecks.unshift(check);saveContextChecks();void runUsefulContextCheck(check,{...config,contextWindow});return json(res,check,202);
+ }
+ const contextStopMatch=u.pathname.match(/^\/api\/context-fit-checks\/([^/]+)\/stop$/);
+ if(req.method==='POST'&&contextStopMatch){const check=contextChecks.find(item=>item.id===contextStopMatch[1]);if(!check||!['queued','starting','running'].includes(check.state))throw Error('This context test is not running.');check.state='stopping';check.phase='Stopping';saveContextChecks();contextCheckControllers.get(check.id)?.abort(Error('Stopped by user.'));if(check.runtimeSession&&tmuxAlive(check.runtimeSession))tm('kill-session','-t',check.runtimeSession);return json(res,{ok:true},202)}
  if(req.method==='POST'&&u.pathname==='/api/models/context-check'){const b=await body(req),model=models().find(item=>item.id===b.model),config=configs().find(item=>item.id===b.config);if(!model||!config)throw Error('Select an available model and configuration.');if(model.runtime!=='llama.cpp')throw Error('Context checks are available for local GGUF models.');if(runs.some(alive)||quickSuites.some(suite=>['queued','starting','running'].includes(suite.state)))throw Error('Finish or remove active tests before loading a model for a clean memory check.');if(contextChecks.some(check=>['queued','starting','running'].includes(check.state)))throw Error('A context check is already running.');if(model.contextWindow&&config.contextWindow>model.contextWindow)throw Error(`This preset exceeds the model metadata limit of ${model.contextWindow.toLocaleString()} tokens.`);releaseIdleManagedRuntimes(model.id,{restartSelected:true});const check={id:randomUUID(),model:model.id,modelName:model.name,config:config.id,configName:config.name,requestedContext:config.contextWindow,declaredContext:model.contextWindow||null,modelBytes:model.fileBytes||null,state:'queued',createdAt:new Date().toISOString(),reportedContext:null,baselineMemoryBytes:null,peakMemoryBytes:null,peakGpuMemoryBytes:null,peakGpuAllocatedBytes:null};contextChecks.unshift(check);saveContextChecks();void runContextCheck(check);return json(res,check,202)}
  if(req.method==='GET'&&u.pathname==='/api/huggingface/search'){const query=(u.searchParams.get('q')||'').trim();if(query.length<2||query.length>100)throw Error('Enter between 2 and 100 characters.');return json(res,{results:await searchHuggingFace(query)});}
  if(req.method==='POST'&&u.pathname==='/api/huggingface/download'){const b=await body(req);if(!validRepo(b.repo)||!Array.isArray(b.files)||!b.files.length||b.files.length>20||!b.files.every(validHfFile))throw Error('Invalid Hugging Face selection.');if(downloads.some(d=>['queued','downloading','stopping'].includes(d.state)))throw Error('A model download is already running.');const job={id:randomUUID(),repo:b.repo,name:String(b.name||b.files[0]).slice(0,160),files:b.files,state:'queued',createdAt:new Date().toISOString(),downloadedBytes:0,totalBytes:Number(b.totalBytes)||0};downloads.unshift(job);saveDownloads();void downloadHuggingFace(job);return json(res,job,202)}
