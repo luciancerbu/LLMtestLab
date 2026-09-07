@@ -15,7 +15,7 @@ const PORT=Number(process.env.PORT||4318);
 const AUTONOMOUS_PROMPT='Autonomous benchmark mode is enabled. Work continuously toward the requested outcome, make reasonable in-scope decisions without asking routine questions, use the available tools, and verify the result before stopping. Ask the user only when genuinely blocked, when required information is missing, or before an unsafe or materially out-of-scope action.';
 fs.mkdirSync(DATA,{recursive:true});
 const promptDefinitions=promptRegistry(),suiteDefinitions=suiteRegistry(),quickSuiteCases=suiteDefinitions.find(suite=>suite.id==='quick').cases;
-const db=path.join(DATA,'runs.json'),suiteDb=path.join(DATA,'quick-suites.json'),downloadDb=path.join(DATA,'downloads.json'),contextDb=path.join(DATA,'context-checks.json'),origin=`http://127.0.0.1:${PORT}`;
+const db=path.join(DATA,'runs.json'),suiteDb=path.join(DATA,'quick-suites.json'),downloadDb=path.join(DATA,'downloads.json'),contextDb=path.join(DATA,'context-checks.json'),serverModeDb=path.join(DATA,'server-mode.json'),origin=`http://127.0.0.1:${PORT}`;
 const folderSelections=new Map();
 function gpuLimit(){
  if(process.platform!=='darwin'||process.arch!=='arm64')return {supported:false,currentMb:null,totalMb:Math.floor(os.totalmem()/1048576),recommendedMaxMb:null};
@@ -34,6 +34,7 @@ let runs=fs.existsSync(db)?JSON.parse(fs.readFileSync(db)):[];
 let quickSuites=fs.existsSync(suiteDb)?JSON.parse(fs.readFileSync(suiteDb)):[];
 let downloads=fs.existsSync(downloadDb)?JSON.parse(fs.readFileSync(downloadDb)):[];
 let contextChecks=fs.existsSync(contextDb)?JSON.parse(fs.readFileSync(contextDb)):[];
+let serverMode=fs.existsSync(serverModeDb)?JSON.parse(fs.readFileSync(serverModeDb)):{enabled:false};
 runs=runs.map(r=>({...r,config:r.config||'balanced'}));
 const save=()=>fs.writeFileSync(db,JSON.stringify(runs,null,2)); save();
 const saveSuites=()=>fs.writeFileSync(suiteDb,JSON.stringify(quickSuites,null,2));
@@ -45,6 +46,7 @@ const saveDownloads=()=>fs.writeFileSync(downloadDb,JSON.stringify(downloads.sli
 for(const download of downloads)if(['queued','downloading'].includes(download.state)){download.state='interrupted';download.error='Dashboard restarted before the download completed.';download.completedAt=new Date().toISOString()}saveDownloads();
 const downloadControllers=new Map();
 const saveContextChecks=()=>fs.writeFileSync(contextDb,JSON.stringify(contextChecks.slice(0,30),null,2));
+const saveServerMode=()=>fs.writeFileSync(serverModeDb,JSON.stringify(serverMode,null,2));
 for(const check of contextChecks)if(['queued','starting','running'].includes(check.state)){check.state='interrupted';check.error='Dashboard restarted before the context check completed.';check.completedAt=new Date().toISOString()}saveContextChecks();
 const tm=(...args)=>execFileSync(TMUX,args,{encoding:'utf8',timeout:5000,maxBuffer:2e6});
 const quote=s=>"'"+s.replaceAll("'","'\\''")+"'";
@@ -116,8 +118,24 @@ function openTerminal(r){
  const escaped=command.replaceAll('\\','\\\\').replaceAll('"','\\"');
  execFileSync('/usr/bin/osascript',['-e',`tell application "Terminal"\nactivate\ndo script "${escaped}"\nend tell`],{encoding:'utf8',timeout:5000});
 }
+function openModelTerminal(model){
+ const session=modelSessionName(model);if(!tmuxAlive(session))throw Error('This model server is not running.');
+ const command=`${quote(TMUX)} attach-session -t ${quote(session)}`,escaped=command.replaceAll('\\','\\\\').replaceAll('"','\\"');
+ execFileSync('/usr/bin/osascript',['-e',`tell application "Terminal"\nactivate\ndo script "${escaped}"\nend tell`],{encoding:'utf8',timeout:5000});
+}
 const tmuxAlive=name=>{try{tm('has-session','-t',name);return true}catch{return false}};
 const modelSessionName=model=>'llm-'+model.id.replace(/[^a-zA-Z0-9_-]/g,'-').slice(0,48);
+function lanAddress(){
+ const addresses=Object.values(os.networkInterfaces()).flat().filter(item=>item&&item.family==='IPv4'&&!item.internal);
+ return addresses.find(item=>/^192\.168\.|^10\.|^172\.(1[6-9]|2\d|3[01])\./.test(item.address))?.address||addresses[0]?.address||null;
+}
+function serverModeFor(model){return serverMode.enabled&&serverMode.modelId===model.id?serverMode:null}
+function runtimeAccess(model){const mode=serverModeFor(model);return {host:mode?'0.0.0.0':new URL(model.baseUrl).hostname,apiKey:mode?.apiKey||model.apiKey||'local',serverMode:!!mode}}
+function serverModeSnapshot(){
+ const model=models().find(item=>item.id===serverMode.modelId),config=configs().find(item=>item.id===serverMode.configId),session=model?modelSessionName(model):null,running=!!session&&tmuxAlive(session),address=lanAddress(),port=model?Number(new URL(model.baseUrl).port||80):null;let ready=false;
+ if(running&&model)try{execFileSync('/usr/bin/curl',['-fsS','--max-time','1','-H','Authorization: Bearer '+serverMode.apiKey,new URL('/health',model.baseUrl).href],{stdio:'ignore',timeout:1500});ready=true}catch{}
+ return {enabled:!!serverMode.enabled,running,ready,state:!serverMode.enabled?'off':ready?'online':running?'starting':'stopped',modelId:model?.id||serverMode.modelId||null,modelName:model?.name||null,configId:config?.id||serverMode.configId||null,configName:config?.name||null,contextWindow:config?.contextWindow||null,url:address&&port?`http://${address}:${port}/v1`:null,apiKey:serverMode.enabled?serverMode.apiKey:null,session,startedAt:serverMode.startedAt||null};
+}
 const effectiveContextWindow=value=>Math.ceil(Number(value)/32)*32;
 const runtimeProfileDir=path.join(DATA,'model-runtimes');
 const runtimeProfileFile=model=>path.join(runtimeProfileDir,model.id.replace(/[^a-zA-Z0-9_-]/g,'-').slice(0,80)+'.json');
@@ -140,15 +158,16 @@ function managedServerArgs(model,config){
  if(config.specDraftMax!==null)runtime.push('--spec-draft-n-max',String(config.specDraftMax));
  return runtime;
 }
-function runtimeProfile(model,args){return JSON.stringify({modelFile:model.modelFile,baseUrl:model.baseUrl,args})}
+function runtimeProfile(model,args,access=runtimeAccess(model)){return JSON.stringify({modelFile:model.modelFile,baseUrl:model.baseUrl,args,host:access.host,serverMode:access.serverMode})}
 function savedRuntimeProfile(model){try{return fs.readFileSync(runtimeProfileFile(model),'utf8')}catch{return null}}
 function runtimeContext(session){try{const command=tm('display-message','-p','-t',session,'#{pane_start_command}'),matches=[...command.matchAll(/["']?--ctx-size["']?\s+["']?(\d+)/g)];return matches.length?Number(matches.at(-1)[1]):null}catch{return null}}
-function reportedRuntimeContext(model,session=modelSessionName(model)){try{const props=new URL('/props',model.baseUrl).href,payload=execFileSync('/usr/bin/curl',['-fsS','--max-time','1','-H','Authorization: Bearer '+(model.apiKey||'local'),props],{encoding:'utf8',timeout:1500,maxBuffer:1e6}),reported=Number(JSON.parse(payload)?.default_generation_settings?.n_ctx);return Number.isInteger(reported)?reported:runtimeContext(session)}catch{return runtimeContext(session)}}
+function reportedRuntimeContext(model,session=modelSessionName(model),apiKey=runtimeAccess(model).apiKey){try{const props=new URL('/props',model.baseUrl).href,payload=execFileSync('/usr/bin/curl',['-fsS','--max-time','1','-H','Authorization: Bearer '+apiKey,props],{encoding:'utf8',timeout:1500,maxBuffer:1e6}),reported=Number(JSON.parse(payload)?.default_generation_settings?.n_ctx);return Number.isInteger(reported)?reported:runtimeContext(session)}catch{return runtimeContext(session)}}
 function modelIsBusy(modelId){return runs.some(run=>run.model===modelId&&alive(run))||quickSuites.some(suite=>suite.model===modelId&&suite.cases?.some(test=>test.tmux&&tmuxAlive(test.tmux)))}
 function releaseIdleManagedRuntimes(selectedModelId,{restartSelected=false}={}){
- for(const candidate of models().filter(item=>item.runtime==='llama.cpp')){
-  if(candidate.id===selectedModelId&&!restartSelected)continue;
-  const session=modelSessionName(candidate);if(!tmuxAlive(session))continue;
+	 for(const candidate of models().filter(item=>item.runtime==='llama.cpp')){
+	  if(candidate.id===selectedModelId&&!restartSelected)continue;
+	  const session=modelSessionName(candidate);if(!tmuxAlive(session))continue;
+	  if(serverModeFor(candidate))throw Error(`Stop Server mode for ${candidate.name} before loading another managed model.`);
   if(modelIsBusy(candidate.id))throw Error(`The managed model ${candidate.name} is still in use. Finish its active test before loading another large model.`);
 	  tm('kill-session','-t',session);waitForPortRelease(candidate);
  }
@@ -158,15 +177,16 @@ function ensureModelRuntime(model,config){
  if(!model.modelFile)throw Error('The GGUF weight file is missing.');
  if(!fs.existsSync(LLAMA_SERVER))throw Error('llama-server is missing. Set LLAMA_SERVER_BIN or install the bundled runtime.');
  releaseIdleManagedRuntimes(model.id);
- const url=new URL(model.baseUrl),port=Number(url.port||80),session=modelSessionName(model),serverArgs=managedServerArgs(model,config),profile=runtimeProfile(model,serverArgs),currentContext=tmuxAlive(session)?reportedRuntimeContext(model,session):null,expectedContext=effectiveContextWindow(config.contextWindow),profileChanged=tmuxAlive(session)&&savedRuntimeProfile(model)!==profile;
+	 const mode=serverModeFor(model);if(mode&&mode.configId!==config.id)throw Error(`Server mode is using the ${configs().find(item=>item.id===mode.configId)?.name||mode.configId} preset. Stop it before changing runtime settings.`);
+	 const url=new URL(model.baseUrl),port=Number(url.port||80),session=modelSessionName(model),serverArgs=managedServerArgs(model,config),access=runtimeAccess(model),profile=runtimeProfile(model,serverArgs,access),currentContext=tmuxAlive(session)?reportedRuntimeContext(model,session,access.apiKey):null,expectedContext=effectiveContextWindow(config.contextWindow),profileChanged=tmuxAlive(session)&&savedRuntimeProfile(model)!==profile;
 	 if(tmuxAlive(session)&&(currentContext!==expectedContext||profileChanged)){if(modelIsBusy(model.id))throw Error(`This model server is currently in use with different runtime settings. Finish the active test before applying this preset.`);tm('kill-session','-t',session);waitForPortRelease(model)}
 	 if(!tmuxAlive(session)){
 	  if(portBusy(port))throw Error('Port '+port+' is already used by another process. Stop that process or change this model’s base URL before retrying.');
-	  const args=[LLAMA_SERVER,'--model',model.modelFile,'--alias',model.id,...serverArgs,'--host',url.hostname,'--port',String(port),'--api-key',model.apiKey||'local'];
+	  const args=[LLAMA_SERVER,'--model',model.modelFile,'--alias',model.id,...serverArgs,'--host',access.host,'--port',String(port),'--api-key',access.apiKey];
   tm('new-session','-d','-s',session,'-x','140','-y','35','-c',ROOT,args.map(quote).join(' '));
   fs.mkdirSync(runtimeProfileDir,{recursive:true});fs.writeFileSync(runtimeProfileFile(model),profile);
  }
- return {session,health:new URL('/health',url).href,props:new URL('/props',url).href,apiKey:model.apiKey||'local',contextWindow:expectedContext,requestedContext:config.contextWindow,serverArgs};
+	 return {session,health:new URL('/health',url).href,props:new URL('/props',url).href,apiKey:access.apiKey,contextWindow:expectedContext,requestedContext:config.contextWindow,serverArgs,serverMode:access.serverMode};
 }
 async function runContextCheck(check){
  try{
@@ -254,8 +274,7 @@ function launch(r){
  if(!model||!config)throw Error('Select an available model and configuration.');
  const runDir=path.join(DATA,r.id);fs.mkdirSync(runDir,{recursive:true});
  const extension=path.join(runDir,'model-config.mjs');
- const provider=providerFor(model,config);
- const runtime=ensureModelRuntime(model,config);
+	 const runtime=ensureModelRuntime(model,config),provider=providerFor(model,config);if(runtime)provider.apiKey=runtime.apiKey;
  fs.writeFileSync(extension,'export default function(pi){pi.registerProvider("bench-local",'+JSON.stringify(provider)+')}\n');
  const resultFile=exitFile(r);fs.rmSync(resultFile,{force:true});
  const progressFile=agentProgressFile(r),previousProgress=agentProgress(r);fs.writeFileSync(progressFile,JSON.stringify({version:1,percent:previousProgress?.percent||0,phase:r.started?'Resuming':'Starting',summary:r.started?'Restoring the saved Pi session.':'Waiting for Pi to create its plan.',updatedAt:new Date().toISOString(),source:'runner'},null,2));
@@ -353,7 +372,7 @@ async function directChat(payload){
  if(!Array.isArray(messages)||!messages.length||messages.length>24)throw Error('Chat history must contain between 1 and 24 messages.');
  let total=0;for(const message of messages){if(!['user','assistant'].includes(message?.role)||typeof message.content!=='string'||!message.content.trim()||message.content.length>10000)throw Error('Chat messages must contain a valid role and 1 to 10,000 characters.');total+=message.content.length}if(total>60000)throw Error('Chat history is too large. Clear the chat and try again.');
  const runtime=ensureModelRuntime(model,config);if(runtime){const deadline=Date.now()+120000;let ready=false;while(Date.now()<deadline){if(!tmuxAlive(runtime.session))throw Error('The managed model exited while loading. Reduce the context or memory pressure.');try{const response=await fetch(runtime.health,{headers:{Authorization:'Bearer '+runtime.apiKey},signal:AbortSignal.timeout(1500)});if(response.ok){ready=true;break}}catch{}await delay(1000)}if(!ready||reportedRuntimeContext(model,runtime.session)<config.contextWindow)throw Error('The model server did not load the requested context within two minutes.')}
- const endpoint=new URL(model.baseUrl);endpoint.pathname=endpoint.pathname.replace(/\/$/,'')+'/chat/completions';const response=await fetch(endpoint,{method:'POST',headers:{Authorization:'Bearer '+(model.apiKey||'local'),'Content-Type':'application/json'},body:JSON.stringify({model:model.providerModelId||model.id,messages:messages.map(({role,content})=>({role,content})),max_tokens:config.maxTokens,temperature:config.temperature,top_p:config.topP,top_k:config.topK,min_p:config.minP}),signal:AbortSignal.timeout(600000)}),text=await response.text();let result;try{result=JSON.parse(text)}catch{result=null}if(!response.ok)throw Error(String(result?.error?.message||text||`Inference server returned HTTP ${response.status}`).slice(0,800));const answer=result?.choices?.[0]?.message,content=answer?.content||answer?.reasoning_content;if(typeof content!=='string'||!content.trim())throw Error('The model returned an empty response.');return {message:content,model:model.name,usage:result.usage||null};
+	 const endpoint=new URL(model.baseUrl);endpoint.pathname=endpoint.pathname.replace(/\/$/,'')+'/chat/completions';const response=await fetch(endpoint,{method:'POST',headers:{Authorization:'Bearer '+(runtime?.apiKey||model.apiKey||'local'),'Content-Type':'application/json'},body:JSON.stringify({model:model.providerModelId||model.id,messages:messages.map(({role,content})=>({role,content})),max_tokens:config.maxTokens,temperature:config.temperature,top_p:config.topP,top_k:config.topK,min_p:config.minP}),signal:AbortSignal.timeout(600000)}),text=await response.text();let result;try{result=JSON.parse(text)}catch{result=null}if(!response.ok)throw Error(String(result?.error?.message||text||`Inference server returned HTTP ${response.status}`).slice(0,800));const answer=result?.choices?.[0]?.message,content=answer?.content||answer?.reasoning_content;if(typeof content!=='string'||!content.trim())throw Error('The model returned an empty response.');return {message:content,model:model.name,usage:result.usage||null};
 }
 function chooseFolder(){return new Promise((resolve,reject)=>execFile('/usr/bin/osascript',['-e','POSIX path of (choose folder with prompt "Choose a project folder for this test session")'],{encoding:'utf8',timeout:60000},(error,stdout,stderr)=>{if(error){if(String(stderr).includes('User canceled'))return resolve(null);return reject(Error('The folder picker could not be opened.'))}resolve(path.resolve(stdout.trim()))}))}
 for(const candidate of recoverableSuiteCases){const suite=quickSuites.find(item=>item.id===candidate.suiteId),test=suite?.cases?.find(item=>item.id===candidate.testId);if(suite&&test)void monitorRecoveredSuiteCase(suite,test)}
@@ -361,10 +380,21 @@ http.createServer(async(req,res)=>{try{
  if(![`127.0.0.1:${PORT}`,`localhost:${PORT}`].includes(req.headers.host))return json(res,{error:'Invalid host'},403);
  if(req.method!=='GET'&&(![origin,`http://localhost:${PORT}`].includes(req.headers.origin)||!req.headers['content-type']?.startsWith('application/json')))return json(res,{error:'Same-origin JSON required'},403);
  const u=new URL(req.url,origin);
- if(req.method==='GET'&&u.pathname==='/api/state')return json(res,{prompts:prompts(),models:models().map(({modelFile,serverArgs,apiKey,...m})=>({...m,metadata:modelMetadata(m),activeContext:m.runtime==='llama.cpp'&&tmuxAlive(modelSessionName(m))?reportedRuntimeContext({...m,apiKey}):null})),servers:publicInferenceServers(),configs:configs(),runs:runSnapshots(),suiteDefinitions:suiteDefinitions.map(suite=>({...suite})),quickSuiteCases:quickSuiteCases.map(test=>({...test})),quickSuites:suiteSnapshots(),downloads:downloads.slice(0,10),contextChecks:contextChecks.slice(0,10),defaultRunFolder:RUNS,system:systemMetrics(),gpuLimit:gpuLimit()});
- if(req.method==='POST'&&u.pathname==='/api/chat')return json(res,await directChat(await body(req)));
- if(req.method==='POST'&&u.pathname==='/api/servers')return json(res,await saveInferenceServer(await body(req)));
- const serverMatch=u.pathname.match(/^\/api\/servers\/([^/]+)\/remove$/);if(req.method==='POST'&&serverMatch){if(runs.some(run=>run.model?.startsWith('remote:'+serverMatch[1]+':')&&alive(run)))throw Error('Finish the active test using this server before removing it.');return json(res,removeInferenceServer(serverMatch[1]))}
+	 if(req.method==='GET'&&u.pathname==='/api/state')return json(res,{prompts:prompts(),models:models().map(({modelFile,serverArgs,apiKey,...m})=>({...m,metadata:modelMetadata(m),activeContext:m.runtime==='llama.cpp'&&tmuxAlive(modelSessionName(m))?reportedRuntimeContext({...m,apiKey}):null})),servers:publicInferenceServers(),serverMode:serverModeSnapshot(),configs:configs(),runs:runSnapshots(),suiteDefinitions:suiteDefinitions.map(suite=>({...suite})),quickSuiteCases:quickSuiteCases.map(test=>({...test})),quickSuites:suiteSnapshots(),downloads:downloads.slice(0,10),contextChecks:contextChecks.slice(0,10),defaultRunFolder:RUNS,system:systemMetrics(),gpuLimit:gpuLimit()});
+	 if(req.method==='POST'&&u.pathname==='/api/chat')return json(res,await directChat(await body(req)));
+	 if(req.method==='POST'&&u.pathname==='/api/servers')return json(res,await saveInferenceServer(await body(req)));
+	 const serverMatch=u.pathname.match(/^\/api\/servers\/([^/]+)\/remove$/);if(req.method==='POST'&&serverMatch){if(runs.some(run=>run.model?.startsWith('remote:'+serverMatch[1]+':')&&alive(run)))throw Error('Finish the active test using this server before removing it.');return json(res,removeInferenceServer(serverMatch[1]))}
+	 if(req.method==='POST'&&u.pathname==='/api/server-mode/start'){
+	  if(serverMode.enabled)throw Error('Server mode is already active. Stop it before starting another model.');
+	  if(runs.some(alive)||quickSuites.some(suite=>suite.cases?.some(test=>test.tmux&&tmuxAlive(test.tmux)))||contextChecks.some(check=>['queued','starting','running','stopping'].includes(check.state)))throw Error('Finish the active workload before starting Server mode.');
+	  const payload=await body(req),model=models().find(item=>item.id===payload.model),config=configs().find(item=>item.id===payload.config);if(!model||!config)throw Error('Select an available model and preset.');if(model.runtime!=='llama.cpp')throw Error('Server mode requires a managed local GGUF model.');if(model.contextWindow&&config.contextWindow>model.contextWindow)throw Error('The selected preset exceeds this model’s context limit.');
+	  releaseIdleManagedRuntimes(model.id,{restartSelected:true});const previous=serverMode;serverMode={enabled:true,modelId:model.id,configId:config.id,apiKey:randomUUID().replaceAll('-',''),startedAt:new Date().toISOString()};saveServerMode();
+	  try{ensureModelRuntime(model,config);return json(res,serverModeSnapshot(),202)}catch(error){serverMode=previous;saveServerMode();throw error}
+	 }
+	 if(req.method==='POST'&&u.pathname==='/api/server-mode/stop'){
+	  if(!serverMode.enabled)throw Error('Server mode is not active.');const model=models().find(item=>item.id===serverMode.modelId);if(model&&modelIsBusy(model.id))throw Error('Finish the active workload using this server before stopping it.');if(model&&tmuxAlive(modelSessionName(model))){tm('kill-session','-t',modelSessionName(model));waitForPortRelease(model)}serverMode={enabled:false,stoppedAt:new Date().toISOString()};saveServerMode();return json(res,serverModeSnapshot());
+	 }
+	 if(req.method==='POST'&&u.pathname==='/api/server-mode/terminal'){const model=models().find(item=>item.id===serverMode.modelId);if(!serverMode.enabled||!model)throw Error('Server mode is not active.');openModelTerminal(model);return json(res,{ok:true})}
  if(req.method==='POST'&&u.pathname==='/api/system/gpu-limit')return json(res,setGpuLimit((await body(req)).mb));
  if(req.method==='POST'&&['/api/quick-suites','/api/models/context-check'].includes(u.pathname)&&quickSuites.some(suite=>suite.cases?.some(test=>test.tmux&&tmuxAlive(test.tmux))))throw Error('Finish the active benchmark process before starting another clean workload.');
  if(req.method==='POST'&&u.pathname==='/api/quick-suites'){const b=await body(req),model=models().find(m=>m.id===b.model),config=configs().find(c=>c.id===b.config),definition=suiteDefinitions.find(suite=>suite.id===(b.suite||'quick'));if(!model||!config)throw Error('Select an available model and configuration.');if(!definition)throw Error('Select a benchmark suite.');if(quickSuites.some(s=>['queued','starting','running'].includes(s.state)))throw Error('A benchmark suite is already running.');if(runs.some(alive))throw Error('Pause or finish active single sessions before starting a benchmark so its speed and memory results remain accurate.');if(model.runtime==='llama.cpp')releaseIdleManagedRuntimes(model.id,{restartSelected:true});const suite={id:randomUUID(),kind:'project-suite',suiteId:definition.id,suiteName:definition.name,suiteVersion:definition.version,repetitions:definition.repetitions,plan:definition.cases.map(test=>({...test})),model:model.id,modelName:model.name,modelSnapshot:modelMetadata(model,config),config:config.id,configName:config.name,configuration:{...config},state:'queued',createdAt:new Date().toISOString(),cases:[],totals:null};quickSuites.unshift(suite);saveSuites();void runProjectSuite(suite);return json(res,suite,202)}

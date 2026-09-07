@@ -13,6 +13,7 @@ No cloud fallback is required for local models. Test projects, conversations, mo
 - Single autonomous Pi sessions or registered multi-app benchmark suites.
 - Clean repetitions in separate folders for meaningful run-to-run comparisons.
 - Ollama, managed `llama.cpp` GGUF, and private-LAN OpenAI-compatible model sources.
+- One-click Server mode for sharing a managed GGUF model on a private LAN.
 - A compact direct-model chat with browser-local history and the same model and preset controls.
 - Built-in Hugging Face GGUF discovery, quantization selection, download progress, stop, and retry.
 - Presets for context, output length, reasoning, sampling, memory fitting, parallel slots, and speculative decoding.
@@ -109,6 +110,14 @@ This is the only built-in workflow that requires internet access.
 Use **Settings → Inference servers → Add inference server** for an OpenAI-compatible endpoint such as `http://192.168.1.50:8080/v1`.
 
 Only loopback, `.local`, private, and link-local addresses are accepted. Public internet endpoints are rejected. API keys stay in ignored `data/servers.json`; they are not returned to the browser by the state API. Leaving the key field blank while editing preserves the saved key.
+
+### Serve a managed model on your LAN
+
+Open **Settings → Server mode**, choose a managed GGUF model and configuration preset, then select **Start LAN server**. Test Lab restarts that model’s persistent `llama-server` tmux runtime on the LAN interface, generates a dedicated access key, and shows the OpenAI-compatible URL, model ID, tmux session, and connection-copy action.
+
+The header changes from **Dashboard ready** to **Server mode · starting/online**, so the dashboard’s role is always visible. The server survives closing the browser or restarting the dashboard. **Open Terminal** exposes the live server log, and **Stop server** disconnects clients and removes the active runtime. Test Lab will not silently replace a model reserved for Server mode with another managed model.
+
+Server mode is intended only for trusted private networks. It does not configure router port forwarding, TLS, or public-internet hardening. Its generated credential is stored in ignored `data/server-mode.json` and is returned only to the loopback dashboard so the user can copy it.
 
 ## Direct model chat
 
