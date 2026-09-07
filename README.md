@@ -198,6 +198,8 @@ Each completed or failed app has two repair paths:
 
 - **Revise** assumes the result is broken or unfinished, asks Pi to inspect it critically, and continues the original saved conversation in the same project folder.
 - **Custom revise** adds the user's exact failure report to that continuation prompt.
+- **Open Terminal** appears while a benchmark case or revision is active and opens its live Pi activity session.
+- **Stop** ends the active case without removing its generated files or saved conversation. While any benchmark case is active, revision buttons on every other result stay disabled.
 
 Revision attempts clear the previous grade, preserve cumulative token and timing evidence, and increment the visible **Prompts** count. This makes a one-shot success distinguishable from an app that needed several repair turns.
 
