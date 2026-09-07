@@ -131,6 +131,8 @@ Chat and benchmarks do not compete for the same runtime. While a benchmark or co
 
 One preset captures both generation behavior and managed `llama.cpp` runtime choices.
 
+Use **Settings → Configuration presets** to create a preset or select an existing `configs/<id>.json` file and choose **Edit selected**. Editing reuses the same form with the stable preset ID locked, so saving updates that file instead of creating a duplicate.
+
 <table>
   <tr>
     <td width="50%"><img src="docs/assets/runtime-preset.png" alt="Generation controls in a configuration preset"></td>
